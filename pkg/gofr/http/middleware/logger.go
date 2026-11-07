@@ -1,0 +1,460 @@
+package middleware
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel/trace"
+)
+
+var errHijackNotSupported = errors.New("response writer does not support hijacking")
+
+// JSON envelope keys for the panic-recovery error response written by
+// panicRecovery. Defined as constants so the same spellings stay
+// consistent across the package and the goconst linter is satisfied.
+const (
+	envelopeCodeKey    = "code"
+	envelopeStatusKey  = "status"
+	envelopeMessageKey = "message"
+
+	// envelopeStatusError is the status the panic-recovery response reports.
+	envelopeStatusError = "ERROR"
+	// unknownPanicType is logged when a recovered panic value is neither a string nor an error.
+	unknownPanicType = "Unknown panic type"
+)
+
+// StatusResponseWriter Defines own Response Writer to be used for logging of status - as http.ResponseWriter does not let us read status.
+type StatusResponseWriter struct {
+	http.ResponseWriter
+	status int
+	// wroteHeader keeps a flag to keep a check that the framework do not attempt to write the header again. This was previously causing
+	// `superfluous response.WriteHeader call`. This is particularly helpful in scenarios where the developer has already written header
+	// in any custom middlewares.
+	wroteHeader bool
+}
+
+func (w *StatusResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader { // Prevent duplicate calls
+		return
+	}
+
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// Write implements http.ResponseWriter. When a handler calls Write without
+// first calling WriteHeader, net/http implicitly sends StatusOK on the
+// wire — record that explicitly here so logs / metrics / tracing see 200
+// instead of 0 for the common "just write the body" pattern.
+func (w *StatusResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.status = http.StatusOK
+		w.wroteHeader = true
+	}
+
+	return w.ResponseWriter.Write(b)
+}
+
+// Status returns the response status code as it would actually appear on
+// the wire. If the handler called neither WriteHeader nor Write, the
+// internal field is still zero but net/http emits an implicit 200 once
+// the handler returns — Status() reports 200 in that case so logs,
+// metrics, and tracing all see a valid HTTP status instead of a
+// poisoned 0.
+func (w *StatusResponseWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+
+	return w.status
+}
+
+// Unwrap returns the wrapped ResponseWriter so http.NewResponseController can reach the underlying
+// connection for Flush and SetWriteDeadline — needed for streaming responses.
+func (w *StatusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// Hijack implements the http.Hijacker interface. So that we are able to upgrade to a websocket
+// connection that requires the responseWriter implementation to implement this method.
+func (w *StatusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+
+	return nil, nil, fmt.Errorf("%w: cannot hijack connection", errHijackNotSupported)
+}
+
+// RequestLog represents a log entry for HTTP requests.
+type RequestLog struct {
+	TraceID      string `json:"trace_id,omitempty"`
+	SpanID       string `json:"span_id,omitempty"`
+	StartTime    string `json:"start_time,omitempty"`
+	ResponseTime int64  `json:"response_time,omitempty"`
+	Method       string `json:"method,omitempty"`
+	UserAgent    string `json:"user_agent,omitempty"`
+	IP           string `json:"ip,omitempty"`
+	URI          string `json:"uri,omitempty"`
+	Response     int    `json:"response,omitempty"`
+}
+
+// zeroTraceID is the canonical 32-zero string the W3C trace-context
+// invalid TraceID prints to. We use it for the X-Correlation-ID
+// response header AND for the request-log field when no SpanContext
+// is in scope, so the wire shape is byte-for-byte identical to what
+// GoFr emitted before PR-7's internal optimization.
+const zeroTraceID = "00000000000000000000000000000000"
+const zeroSpanID = "0000000000000000"
+
+func (rl *RequestLog) PrettyPrint(writer io.Writer) {
+	fmt.Fprintf(writer, "\u001B[38;5;8m%s \u001B[38;5;%dm%-6d\u001B[0m "+
+		"%8d\u001B[38;5;8mµs\u001B[0m %s %s \n", rl.TraceID, colorForStatusCode(rl.Response), rl.Response, rl.ResponseTime, rl.Method, rl.URI)
+}
+
+func colorForStatusCode(status int) int {
+	const (
+		blue   = 34
+		red    = 202
+		yellow = 220
+	)
+
+	switch {
+	case status >= 200 && status < 300:
+		return blue
+	case status >= 400 && status < 500:
+		return yellow
+	case status >= 500 && status < 600:
+		return red
+	}
+
+	return 0
+}
+
+// canonicalCorrelationID is the canonical spelling of the correlation-ID header
+// -- textproto.CanonicalMIMEHeaderKey("X-Correlation-ID") -- written out so no
+// request pays to build it and nothing can reassign it. The equivalence is
+// pinned by TestCorrelationIDHeaderSpellingUnchanged.
+const canonicalCorrelationID = "X-Correlation-Id"
+
+type logger interface {
+	Log(...any)
+	Error(...any)
+}
+
+// logEnabler is the optional fast-path interface. Building a request-log entry
+// costs a struct, a formatted timestamp and a client-IP lookup, all before the
+// logger gets to decide whether the entry is emitted at all. A logger that can
+// answer that question first lets the middleware skip the work entirely.
+//
+// It is deliberately expressed without the logging package's Level type so this
+// middleware keeps its minimal logger contract. An implementation that does not
+// provide it behaves exactly as before.
+type logEnabler interface {
+	LogEnabled() bool
+}
+
+// entryLogger is the optional fast-path interface for logging one already-built
+// entry.
+//
+// The plain logger contract is Log(...any), so Log(l) allocates a one-element
+// []any on every request purely to be unwrapped again inside the logger. A
+// logger that can take the entry directly avoids it. An implementation without
+// these methods falls back to Log/Error and behaves exactly as before, so no
+// external logger is affected.
+type entryLogger interface {
+	LogEntry(any)
+	ErrorEntry(any)
+}
+
+// logSink is the logger together with the optional interfaces it turned out to
+// satisfy, resolved once when the middleware is built.
+//
+// Both assertions answer a question about the logger's type, which cannot change
+// between requests, so asking per request is asking the same question repeatedly.
+// newHistogramRecorder and remotelogger.New both resolve their optional
+// interfaces at construction for the same reason; this keeps the three
+// consistent. A logger providing neither leaves both fields nil and takes the
+// Log/Error path exactly as before.
+type logSink struct {
+	logger  logger
+	enabler logEnabler
+	entries entryLogger
+}
+
+// newLogSink returns a pointer, and that is load-bearing rather than stylistic.
+//
+// In the default mux matcher the middleware chain is rebuilt inside Route.Match on every request, so
+// the closure Logging returns is allocated per request and pays for everything it captures. Capturing
+// a logSink by value made that closure 48 bytes larger: BenchmarkLogging went 1249 -> 1297 B/op, a
+// regression this optimization would otherwise have shipped alongside its saving. Captured as a
+// pointer it is 8 bytes, and routing panicRecovery through sink.logger drops the separate 16-byte
+// logger interface the closure used to hold as well, which brings it back to 1249 exactly.
+//
+// The trie matcher memoises its chain per route, so none of this is visible there. Measured at
+// 2000x, count=6, darwin/arm64; allocs/op is 10 throughout and does not move.
+func newLogSink(l logger) *logSink {
+	s := &logSink{logger: l}
+
+	if l == nil {
+		return s
+	}
+
+	if e, ok := l.(logEnabler); ok {
+		s.enabler = e
+	}
+
+	if e, ok := l.(entryLogger); ok {
+		s.entries = e
+	}
+
+	return s
+}
+
+// Logging is a middleware which logs response status and time in milliseconds along with other data.
+//
+// The StatusResponseWriter wrapper allocated per request is pooled in a
+// closure-owned sync.Pool — the pool is constructed once per Logging()
+// invocation (typically once per app) and tied to this middleware's
+// lifetime, not the package, so we avoid a shared global. Reset() zeros
+// the writer fields before Put so a stale ResponseWriter pointer can
+// never leak across requests.
+func Logging(probes LogProbes, logger logger) func(inner http.Handler) http.Handler {
+	pool := sync.Pool{
+		New: func() any { return &StatusResponseWriter{} },
+	}
+
+	// The optional interfaces are resolved once, here, from what the logger
+	// supports. The per-request path then carries none of that branching.
+	sink := newLogSink(logger)
+
+	return func(inner http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srw := pool.Get().(*StatusResponseWriter)
+			srw.ResponseWriter = w
+			srw.status = 0
+			srw.wroteHeader = false
+
+			// Only the ResponseWriter pointer is cleared on Put — leaving it
+			// dangling would keep the previous request's writer (and its
+			// underlying *http.response, headers, etc.) alive until the pool
+			// entry is next claimed. status/wroteHeader are reset on the next
+			// Get above; resetting them here too is redundant.
+			defer func() {
+				srw.ResponseWriter = nil
+				pool.Put(srw)
+			}()
+
+			// Fetch the SpanContext once. GoFr installs an SDK provider with NeverSample
+			// when no exporter is configured, so the default deployment has a VALID span
+			// context and both IDs are real -- the zero-string constants below are for
+			// the genuinely absent case, not the common one.
+			sc := trace.SpanFromContext(r.Context()).SpanContext()
+
+			// Both IDs are resolved here, in one allocation. The trace ID is
+			// needed before the handler runs, for the X-Correlation-ID response
+			// header; the span ID is only used inside the log entry, so a request
+			// whose entry the level gate discards pays for 16 bytes it does not
+			// use. That costs no extra allocation -- one buffer covers both -- and
+			// saves one on every request that IS logged, which is the default.
+			traceID, spanID := traceSpanIDs(sc)
+
+			// Assigned rather than Set: Header.Set canonicalizes its key on
+			// every call, and "X-Correlation-ID" is not already in canonical
+			// form ("Id", not "ID"), so each request paid for building the
+			// canonical string. The wire format is unchanged -- net/http emits
+			// the canonical spelling either way.
+			srw.Header()[canonicalCorrelationID] = []string{traceID}
+
+			defer func() { panicRecovery(recover(), srw, sink.logger) }()
+
+			// Skip logging for default probe paths if log probes are disabled.
+			// time.Now() (vDSO call) is deferred past this so probe paths do
+			// not pay for a timestamp that is then thrown away.
+			if isLogProbeDisabled(probes, r.URL.Path) {
+				inner.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+			defer handleRequestLog(srw, r, start, traceID, spanID, sink)
+
+			inner.ServeHTTP(srw, r)
+		})
+	}
+}
+
+func handleRequestLog(srw *StatusResponseWriter, r *http.Request, start time.Time,
+	traceID, spanID string, sink *logSink) {
+	status := srw.Status()
+
+	// A server error is reported through Error, which survives every level below
+	// FATAL, so gating it on the informational level would be wrong. Only the
+	// informational path can be skipped.
+	if status < http.StatusInternalServerError {
+		if sink.enabler != nil && !sink.enabler.LogEnabled() {
+			return
+		}
+	}
+
+	l := &RequestLog{
+		TraceID:      traceID,
+		SpanID:       spanID,
+		StartTime:    start.Format("2006-01-02T15:04:05.999999999-07:00"),
+		ResponseTime: time.Since(start).Nanoseconds() / 1000,
+		Method:       r.Method,
+		UserAgent:    r.UserAgent(),
+		IP:           getIPAddress(r),
+		URI:          r.RequestURI,
+		Response:     status,
+	}
+
+	if sink.logger == nil {
+		return
+	}
+
+	if sink.entries != nil {
+		if status >= http.StatusInternalServerError {
+			sink.entries.ErrorEntry(l)
+		} else {
+			sink.entries.LogEntry(l)
+		}
+
+		return
+	}
+
+	if status >= http.StatusInternalServerError {
+		sink.logger.Error(l)
+	} else {
+		sink.logger.Log(l)
+	}
+}
+
+// isLogProbeDisabled checks if probes are disabled to skip logging for default probe paths
+// and additional health check paths of services.
+func isLogProbeDisabled(probes LogProbes, urlPath string) bool {
+	// if probes is not disabled, dont need to check for default probe paths
+	if !probes.Disabled {
+		return false
+	}
+
+	// check if urlPath is in the list of default probe paths and matches any of the values in the map
+	for _, path := range probes.Paths {
+		if urlPath == path && probes.Disabled {
+			return true
+		}
+	}
+
+	return false
+}
+
+func getIPAddress(r *http.Request) string {
+	// According to GCLB Documentation (https://cloud.google.com/load-balancing/docs/https/), IPs are added in following sequence.
+	// X-Forwarded-For: <unverified IP(s)>, <immediate client IP>, <global forwarding rule external IP>, <proxies running in GCP>
+	//
+	// We only need the first entry, so take it with IndexByte instead of
+	// strings.Split, which would allocate a []string on every request.
+	xff := r.Header.Get("X-Forwarded-For")
+
+	ipAddress := xff
+	if i := strings.IndexByte(xff, ','); i >= 0 {
+		ipAddress = xff[:i]
+	}
+
+	if ipAddress == "" {
+		ipAddress = r.RemoteAddr
+	}
+
+	return strings.TrimSpace(ipAddress)
+}
+
+type panicLog struct {
+	Error      string `json:"error,omitempty"`
+	StackTrace string `json:"stack_trace,omitempty"`
+}
+
+func panicRecovery(re any, w http.ResponseWriter, logger logger) {
+	if re == nil {
+		return
+	}
+
+	var e string
+
+	switch t := re.(type) {
+	case string:
+		e = t
+	case error:
+		e = t.Error()
+	default:
+		e = unknownPanicType
+	}
+
+	logger.Error(panicLog{
+		Error:      e,
+		StackTrace: string(debug.Stack()),
+	})
+
+	w.WriteHeader(http.StatusInternalServerError)
+
+	res := map[string]any{
+		envelopeCodeKey:    http.StatusInternalServerError,
+		envelopeStatusKey:  envelopeStatusError,
+		envelopeMessageKey: "Some unexpected error has occurred",
+	}
+
+	// The envelope is a fixed map that always marshals, so Encode can only fail writing to the
+	// client; the status is already committed, so logging the failure is all that is left to do.
+	// net/http buffers the first 2 KB of a response, and this envelope is well under that, so a
+	// client that has gone away usually does not surface here: no log does not mean it was received.
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		logger.Error("failed to write panic recovery response: " + err.Error())
+	}
+}
+
+// traceSpanIDs renders both IDs into ONE allocation.
+//
+// otel's TraceID.String() and SpanID.String() each render the hex into a stack
+// array and then convert it with string(...). At the pinned
+// go.opentelemetry.io/otel/trace v1.46.0 that array is built from a nibble
+// lookup table rather than hex.EncodeToString -- trace.go:60 and trace.go:111 --
+// so neither call is wasteful in itself: each simply costs the one string
+// allocation its own result needs. The waste is that there are two results. A
+// logged request always needs both -- the trace ID for the correlation header,
+// both for the log entry -- so rendering them into a single buffer and slicing it
+// gives byte-identical strings for one allocation instead of two.
+//
+// The span ID is now formatted before the level gate rather than after it, so a
+// request whose entry is discarded pays for 16 bytes it does not use. That costs
+// no extra allocation -- the one buffer covers both -- and it buys an allocation
+// on every request that IS logged, which is the default configuration.
+func traceSpanIDs(sc trace.SpanContext) (traceID, spanID string) {
+	if !sc.IsValid() {
+		return zeroTraceID, zeroSpanID
+	}
+
+	tid, sid := sc.TraceID(), sc.SpanID()
+
+	// The buffer is sized from the zero-string constants because those are the
+	// wire widths this function has to reproduce. The split, though, comes from
+	// what hex.Encode reports it wrote, not from restating a constant: editing
+	// either constant then changes the buffer and the offset together instead of
+	// silently moving one slice bound past the other.
+	var b [len(zeroTraceID) + len(zeroSpanID)]byte
+
+	n := hex.Encode(b[:], tid[:])
+	hex.Encode(b[n:], sid[:])
+
+	s := string(b[:])
+
+	return s[:n], s[n:]
+}

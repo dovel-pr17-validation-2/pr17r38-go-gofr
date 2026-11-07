@@ -1,0 +1,895 @@
+package rbac
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"gofr.dev/pkg/gofr/container"
+)
+
+// TestLoadPermissions_RegistersNoMetric pins that loading a config registers nothing: EnableRBAC
+// registers the extraction counter once per app, and a load that registered it too would log a
+// duplicate-metric error on every second load.
+func TestLoadPermissions_RegistersNoMetric(t *testing.T) {
+	testCases := []struct {
+		desc    string
+		content string
+	}{
+		{
+			desc: "roles mode",
+			content: `{"roleHeader": "X-User-Role", "roles": [{"name": "admin", "permissions": ["orders:read"]}], ` +
+				`"endpoints": [{"path": "/orders", "methods": ["GET"], "requiredPermissions": ["orders:read"]}]}`,
+		},
+		{
+			desc: "permissions mode",
+			content: `{"permissionsClaimPath": "scope", "endpoints": ` +
+				`[{"path": "/orders", "methods": ["GET"], "requiredPermissions": ["orders:read"]}]}`,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rbac.json")
+			require.NoError(t, os.WriteFile(path, []byte(tc.content), 0600))
+
+			// No expectations: any registration fails the test.
+			metrics := container.NewMockMetrics(gomock.NewController(t))
+
+			_, err := LoadPermissions(path, &mockLogger{}, metrics, nil)
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+func TestLoadPermissions_ValidConfigs(t *testing.T) {
+	t.Run("loads valid json config", func(t *testing.T) {
+		fileContent := `{
+			"roles": [{"name": "admin", "permissions": ["admin:read", "admin:write"]}],
+			"endpoints": [{"path": "/api", "methods": ["GET"], "requiredPermissions": ["admin:read"]}]
+		}`
+		path, err := createTestConfigFile("test_config.json", fileContent)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_config.json", nil, nil, nil)
+		require.NoError(t, err)
+		require.NotNil(t, config)
+		assert.NotNil(t, config.rolePermissionsMap)
+	})
+
+	t.Run("loads valid yaml config", func(t *testing.T) {
+		fileContent := `roles:
+  - name: admin
+    permissions: ["admin:read", "admin:write"]
+endpoints:
+  - path: /api
+    methods: ["GET"]
+    requiredPermissions: ["admin:read"]`
+		path, err := createTestConfigFile("test_config.yaml", fileContent)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_config.yaml", nil, nil, nil)
+		require.NoError(t, err)
+		require.NotNil(t, config)
+		assert.NotNil(t, config.rolePermissionsMap)
+	})
+
+	t.Run("loads valid yml config", func(t *testing.T) {
+		fileContent := `roles:
+  - name: viewer
+    permissions: ["users:read"]`
+		path, err := createTestConfigFile("test_config.yml", fileContent)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_config.yml", nil, nil, nil)
+		require.NoError(t, err)
+		require.NotNil(t, config)
+		assert.NotNil(t, config.rolePermissionsMap)
+	})
+}
+
+func TestLoadPermissions_ErrorCases(t *testing.T) {
+	t.Run("returns error for non-existent file", func(t *testing.T) {
+		config, err := LoadPermissions("nonexistent.json", nil, nil, nil)
+		require.Error(t, err)
+		require.Nil(t, config)
+	})
+
+	t.Run("returns error for invalid json", func(t *testing.T) {
+		path, err := createTestConfigFile("test_invalid.json", `invalid json{`)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_invalid.json", nil, nil, nil)
+		require.Error(t, err)
+		require.Nil(t, config)
+	})
+
+	t.Run("returns error for invalid yaml", func(t *testing.T) {
+		path, err := createTestConfigFile("test_invalid.yaml", `invalid: yaml: [`)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_invalid.yaml", nil, nil, nil)
+		require.Error(t, err)
+		require.Nil(t, config)
+	})
+
+	t.Run("returns error for unsupported format", func(t *testing.T) {
+		path, err := createTestConfigFile("test.txt", `some content`)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test.txt", nil, nil, nil)
+		require.Error(t, err)
+		require.Nil(t, config)
+	})
+
+	t.Run("returns error for endpoint without requiredPermissions", func(t *testing.T) {
+		fileContent := `{
+			"roles": [{"name": "admin", "permissions": ["*:*"]}],
+			"endpoints": [{"path": "/api", "methods": ["GET"]}]
+		}`
+		path, err := createTestConfigFile("test_missing_perm.json", fileContent)
+		require.NoError(t, err)
+
+		defer os.Remove(path)
+
+		config, err := LoadPermissions("test_missing_perm.json", nil, nil, nil)
+		require.Error(t, err)
+		require.Nil(t, config)
+	})
+}
+
+func TestConfig_GetRolePermissions(t *testing.T) {
+	testCases := []struct {
+		desc          string
+		config        *Config
+		role          string
+		expectedPerms []string
+	}{
+		{
+			desc: "returns permissions for existing role",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+					{Name: "viewer", Permissions: []string{"users:read"}},
+				},
+			},
+			role:          "admin",
+			expectedPerms: []string{"*:*"},
+		},
+		{
+			desc: "returns empty for non-existent role",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+			},
+			role:          "nonexistent",
+			expectedPerms: nil,
+		},
+		{
+			desc: "returns permissions with inheritance",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+					{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+				},
+			},
+			role:          "editor",
+			expectedPerms: []string{"users:write", "users:read"},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := tc.config.processUnifiedConfig()
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+
+			result := tc.config.GetRolePermissions(tc.role)
+
+			assert.Equal(t, tc.expectedPerms, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+func TestConfig_GetEndpointPermission_ExactMatch(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/api/users", Methods: []string{"GET"}, RequiredPermissions: []string{"users:read"}},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/api/users")
+	assert.Equal(t, []string{"users:read"}, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_PublicEndpoint(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/health", Methods: []string{"GET"}, Public: true},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/health")
+	assert.Nil(t, perms)
+	assert.True(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_NotFound(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/api/users", Methods: []string{"GET"}, RequiredPermissions: []string{"users:read"}},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("POST", "/api/posts")
+	assert.Nil(t, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_MuxPattern(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/api/{resource}", Methods: []string{"GET"}, RequiredPermissions: []string{"api:read"}},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/api/users")
+	assert.Equal(t, []string{"api:read"}, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_MuxPatternWithConstraint(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/api/users/{id:[0-9]+}", Methods: []string{"GET"}, RequiredPermissions: []string{"users:read"}},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/api/users/123")
+	assert.Equal(t, []string{"users:read"}, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_CaseInsensitive(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{Path: "/api", Methods: []string{"get"}, RequiredPermissions: []string{"api:read"}},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/api")
+	assert.Equal(t, []string{"api:read"}, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_GetEndpointPermission_MultiplePermissions(t *testing.T) {
+	config := &Config{
+		Endpoints: []EndpointMapping{
+			{
+				Path:                "/api/users",
+				Methods:             []string{"GET"},
+				RequiredPermissions: []string{"users:read", "users:admin"},
+			},
+		},
+	}
+	err := config.processUnifiedConfig()
+	require.NoError(t, err)
+
+	perms, isPublic := config.GetEndpointPermission("GET", "/api/users")
+	assert.Equal(t, []string{"users:read", "users:admin"}, perms)
+	assert.False(t, isPublic)
+}
+
+func TestConfig_processUnifiedConfig(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		config      *Config
+		expectError bool
+	}{
+		{
+			desc: "processes config with roles and endpoints",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/api", Methods: []string{"GET"}, RequiredPermissions: []string{"admin:*"}},
+				},
+			},
+			expectError: false,
+		},
+		{
+			desc: "processes config with role inheritance",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+					{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/api/users", Methods: []string{"GET"}, RequiredPermissions: []string{"users:read"}},
+				},
+			},
+			expectError: false,
+		},
+		{
+			desc: "returns error for endpoint without requiredPermissions",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/api", Methods: []string{"GET"}},
+				},
+			},
+			expectError: true,
+		},
+		{
+			desc: "processes config with public endpoints",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/health", Methods: []string{"GET"}, Public: true},
+				},
+			},
+			expectError: false,
+		},
+		{
+			desc: "processes config with empty methods",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/api", Methods: []string{}, RequiredPermissions: []string{"admin:*"}},
+				},
+			},
+			expectError: false,
+		},
+		{
+			desc: "processes config with regex endpoints",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "admin", Permissions: []string{"*:*"}},
+				},
+				Endpoints: []EndpointMapping{
+					{Path: "/api/users/{id:[0-9]+}", Methods: []string{"GET"}, RequiredPermissions: []string{"admin:*"}},
+				},
+			},
+			expectError: false,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := tc.config.processUnifiedConfig()
+
+			if tc.expectError {
+				require.Error(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+				return
+			}
+
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.NotNil(t, tc.config.rolePermissionsMap, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.NotNil(t, tc.config.endpointPermissionMap, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+func createTestConfigFile(filename, content string) (string, error) {
+	dir := filepath.Dir(filename)
+	if dir != "." && dir != "" {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	err := os.WriteFile(filename, []byte(content), 0600)
+
+	return filename, err
+}
+
+func TestConfig_Resolve(t *testing.T) {
+	t.Run("finds endpoint with mux pattern", func(t *testing.T) {
+		config := &Config{
+			Endpoints: []EndpointMapping{
+				{Path: "/api/{resource}", Methods: []string{"GET"}, RequiredPermissions: []string{"api:read"}},
+			},
+		}
+		err := config.processUnifiedConfig()
+		require.NoError(t, err)
+
+		endpoint, isPublic := config.resolve("GET", "/api/users")
+		assert.NotNil(t, endpoint)
+		assert.Equal(t, "/api/{resource}", endpoint.Path)
+		assert.False(t, isPublic)
+	})
+
+	t.Run("finds endpoint with mux pattern constraint", func(t *testing.T) {
+		config := &Config{
+			Endpoints: []EndpointMapping{
+				{Path: "/api/users/{id:[0-9]+}", Methods: []string{"GET"}, RequiredPermissions: []string{"users:read"}},
+			},
+		}
+		err := config.processUnifiedConfig()
+		require.NoError(t, err)
+
+		endpoint, isPublic := config.resolve("GET", "/api/users/123")
+		assert.NotNil(t, endpoint)
+		assert.False(t, isPublic)
+	})
+
+	t.Run("finds public endpoint with pattern", func(t *testing.T) {
+		config := &Config{
+			Endpoints: []EndpointMapping{
+				{Path: "/public/{path:.*}", Methods: []string{"GET"}, Public: true},
+			},
+		}
+		err := config.processUnifiedConfig()
+		require.NoError(t, err)
+
+		endpoint, isPublic := config.resolve("GET", "/public/files")
+		assert.NotNil(t, endpoint)
+		assert.True(t, isPublic)
+	})
+
+	t.Run("returns nil when no pattern matches", func(t *testing.T) {
+		config := &Config{
+			Endpoints: []EndpointMapping{
+				{Path: "/api/{resource}", Methods: []string{"GET"}, RequiredPermissions: []string{"api:read"}},
+			},
+		}
+		err := config.processUnifiedConfig()
+		require.NoError(t, err)
+
+		endpoint, isPublic := config.resolve("GET", "/other/path")
+		assert.Nil(t, endpoint)
+		assert.False(t, isPublic)
+	})
+
+	t.Run("returns nil when method doesn't match", func(t *testing.T) {
+		config := &Config{
+			Endpoints: []EndpointMapping{
+				{Path: "/api/{resource}", Methods: []string{"GET"}, RequiredPermissions: []string{"api:read"}},
+			},
+		}
+		err := config.processUnifiedConfig()
+		require.NoError(t, err)
+
+		endpoint, isPublic := config.resolve("POST", "/api/users")
+		assert.Nil(t, endpoint)
+		assert.False(t, isPublic)
+	})
+}
+
+func TestConfig_getEffectivePermissions(t *testing.T) {
+	testCases := []struct {
+		desc          string
+		config        *Config
+		roleName      string
+		expectedPerms []string
+	}{
+		{
+			desc: "returns permissions for role without inheritance",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+				},
+			},
+			roleName:      "viewer",
+			expectedPerms: []string{"users:read"},
+		},
+		{
+			desc: "returns permissions with single level inheritance",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+					{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+				},
+			},
+			roleName:      "editor",
+			expectedPerms: []string{"users:write", "users:read"},
+		},
+		{
+			desc: "returns permissions with multi-level inheritance",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+					{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+					{Name: "admin", Permissions: []string{"users:delete"}, InheritsFrom: []string{"editor"}},
+				},
+			},
+			roleName:      "admin",
+			expectedPerms: []string{"users:delete", "users:write", "users:read"},
+		},
+		{
+			desc: "handles circular inheritance gracefully",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "role1", Permissions: []string{"perm1"}, InheritsFrom: []string{"role2"}},
+					{Name: "role2", Permissions: []string{"perm2"}, InheritsFrom: []string{"role1"}},
+				},
+			},
+			roleName:      "role1",
+			expectedPerms: []string{"perm1", "perm2"},
+		},
+		{
+			desc: "returns empty for non-existent role",
+			config: &Config{
+				Roles: []RoleDefinition{
+					{Name: "viewer", Permissions: []string{"users:read"}},
+				},
+			},
+			roleName:      "nonexistent",
+			expectedPerms: nil,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			result := tc.config.getEffectivePermissions(tc.roleName)
+
+			assert.Equal(t, tc.expectedPerms, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+type buildRolePermissionsMapTestCase struct {
+	desc          string
+	roles         []RoleDefinition
+	expectedPerms map[string][]string
+	expectedLogs  []string
+}
+
+func buildRolePermissionsMapTestCases() []buildRolePermissionsMapTestCase {
+	return []buildRolePermissionsMapTestCase{
+		{
+			desc: "inherits from every known role without logging",
+			roles: []RoleDefinition{
+				{Name: "viewer", Permissions: []string{"users:read"}},
+				{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+			},
+			expectedPerms: map[string][]string{
+				"viewer": {"users:read"},
+				"editor": {"users:write", "users:read"},
+			},
+		},
+		{
+			desc: "keeps own permissions and logs an unknown parent",
+			roles: []RoleDefinition{
+				{Name: "viewer", Permissions: []string{"users:read"}},
+				{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewr"}},
+			},
+			expectedPerms: map[string][]string{
+				"viewer": {"users:read"},
+				"editor": {"users:write"},
+			},
+			expectedLogs: []string{
+				`RBAC: role "editor" inherits from unknown role "viewr"; no permissions are inherited from it`,
+			},
+		},
+		{
+			desc: "logs an unknown parent once when reached through another role",
+			roles: []RoleDefinition{
+				{Name: "viewer", Permissions: []string{"users:read"}, InheritsFrom: []string{"guset"}},
+				{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+			},
+			expectedPerms: map[string][]string{
+				"viewer": {"users:read"},
+				"editor": {"users:write", "users:read"},
+			},
+			expectedLogs: []string{
+				`RBAC: role "viewer" inherits from unknown role "guset"; no permissions are inherited from it`,
+			},
+		},
+		{
+			desc: "logs each unknown parent of a role",
+			roles: []RoleDefinition{
+				{Name: "admin", Permissions: []string{"users:delete"}, InheritsFrom: []string{"editr", "viewr"}},
+			},
+			expectedPerms: map[string][]string{
+				"admin": {"users:delete"},
+			},
+			expectedLogs: []string{
+				`RBAC: role "admin" inherits from unknown role "editr"; no permissions are inherited from it`,
+				`RBAC: role "admin" inherits from unknown role "viewr"; no permissions are inherited from it`,
+			},
+		},
+		{
+			desc: "logs an unknown parent once when a role declares it twice",
+			roles: []RoleDefinition{
+				{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewr", "viewr"}},
+			},
+			expectedPerms: map[string][]string{
+				"editor": {"users:write"},
+			},
+			expectedLogs: []string{
+				`RBAC: role "editor" inherits from unknown role "viewr"; no permissions are inherited from it`,
+			},
+		},
+		{
+			desc: "checks only the role definition the resolver uses when a name repeats",
+			roles: []RoleDefinition{
+				{Name: "viewer", Permissions: []string{"users:read"}},
+				{Name: "editor", Permissions: []string{"users:write"}, InheritsFrom: []string{"viewer"}},
+				{Name: "editor", Permissions: []string{"users:delete"}, InheritsFrom: []string{"viewr"}},
+			},
+			expectedPerms: map[string][]string{
+				"viewer": {"users:read"},
+				"editor": {"users:write", "users:read"},
+			},
+		},
+	}
+}
+
+func TestConfig_buildRolePermissionsMap(t *testing.T) {
+	for i, tc := range buildRolePermissionsMapTestCases() {
+		t.Run(tc.desc, func(t *testing.T) {
+			logger := &mockLogger{}
+			config := &Config{Roles: tc.roles, Logger: logger}
+			config.initializeMaps()
+
+			config.buildRolePermissionsMap()
+
+			assert.Equal(t, tc.expectedPerms, config.rolePermissionsMap, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.Equal(t, tc.expectedLogs, logger.errorLogs, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+
+	t.Run("does not panic without a logger", func(t *testing.T) {
+		config := &Config{Roles: []RoleDefinition{{Name: "editor", InheritsFrom: []string{"viewr"}}}}
+		config.initializeMaps()
+
+		assert.NotPanics(t, config.buildRolePermissionsMap)
+	})
+}
+
+func TestExtractNestedClaim_Additional(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		claims      jwt.MapClaims
+		path        string
+		expected    any
+		expectError bool
+	}{
+		{
+			desc: "extracts claim with jwt.MapClaims nested",
+			claims: jwt.MapClaims{
+				"user": jwt.MapClaims{
+					"role": "admin",
+				},
+			},
+			path:        "user.role",
+			expected:    "admin",
+			expectError: false,
+		},
+		{
+			desc: "returns error when intermediate value is not map",
+			claims: jwt.MapClaims{
+				"user": "not a map",
+			},
+			path:        "user.role",
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			desc: "extracts from mixed map types",
+			claims: jwt.MapClaims{
+				"level1": map[string]any{
+					"level2": jwt.MapClaims{
+						"value": "test",
+					},
+				},
+			},
+			path:        "level1.level2.value",
+			expected:    "test",
+			expectError: false,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			result, err := extractNestedClaim(tc.claims, tc.path)
+
+			if tc.expectError {
+				require.Error(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+				assert.Nil(t, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+
+				return
+			}
+
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.Equal(t, tc.expected, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+func TestExtractArrayClaim_Additional(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		claims      jwt.MapClaims
+		path        string
+		expected    any
+		expectError bool
+	}{
+		{
+			desc: "extracts from array with valid index",
+			claims: jwt.MapClaims{
+				"roles": []any{"admin", "user", "guest"},
+			},
+			path:        "roles[2]",
+			expected:    "guest",
+			expectError: false,
+		},
+		{
+			desc: "returns error for invalid array notation format",
+			claims: jwt.MapClaims{
+				"roles": []any{"admin"},
+			},
+			path:        "roles]0[",
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			desc: "returns error for non-numeric index",
+			claims: jwt.MapClaims{
+				"roles": []any{"admin"},
+			},
+			path:        "roles[abc]",
+			expected:    nil,
+			expectError: true,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			idx := 0
+
+			for j, c := range tc.path {
+				if c == '[' {
+					idx = j
+					break
+				}
+			}
+
+			result, err := extractArrayClaim(tc.claims, tc.path, idx)
+
+			if tc.expectError {
+				require.Error(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+				assert.Nil(t, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+
+				return
+			}
+
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.Equal(t, tc.expected, result, "TEST[%d], Failed.\n%s", i, tc.desc)
+		})
+	}
+}
+
+func TestLoadPermissions_ClaimModes(t *testing.T) {
+	const endpoints = `"endpoints": [{"path": "/orders", "methods": ["GET"], "requiredPermissions": ["orders:read"]}]`
+
+	testCases := []struct {
+		desc      string
+		file      string
+		content   string
+		wantErr   error
+		perms     string
+		startLine string
+		warn      string
+	}{
+		{
+			desc: "permissions mode from json", file: "rbac.json",
+			content: `{"permissionsClaimPath": "scope", ` + endpoints + `}`,
+			perms:   "scope", startLine: "RBAC enabled: mode=permissions, source=scope",
+		},
+		{
+			desc: "permissions mode from yaml", file: "rbac.yaml",
+			content: "permissionsClaimPath: scope\nendpoints:\n" +
+				"  - path: /orders\n    methods: [GET]\n    requiredPermissions: [orders:read]\n",
+			perms: "scope", startLine: "RBAC enabled: mode=permissions, source=scope",
+		},
+		{
+			desc: "permissions mode with a nested path and an index loads", file: "rbac.json",
+			content: `{"permissionsClaimPath": "realm.access[0]", ` + endpoints + `}`,
+			perms:   "realm.access[0]", startLine: "RBAC enabled: mode=permissions, source=realm.access[0]",
+		},
+		{
+			desc: "roles mode keeps loading a claim path it cannot parse, as before", file: "rbac.json",
+			content:   `{"jwtClaimPath": "roles[x]", "roles": [{"name": "a", "permissions": ["orders:read"]}], ` + endpoints + `}`,
+			startLine: "RBAC enabled: mode=roles, source=roles[x]",
+		},
+		{
+			desc: "header mode", file: "rbac.json",
+			content:   `{"roleHeader": "X-User-Role", "roles": [{"name": "a", "permissions": ["orders:read"]}], ` + endpoints + `}`,
+			startLine: "RBAC enabled: mode=header, source=X-User-Role",
+		},
+		{
+			desc: "both claim paths are rejected", file: "rbac.json",
+			content: `{"jwtClaimPath": "roles", "permissionsClaimPath": "scope", ` + endpoints + `}`,
+			wantErr: errBothClaimPaths,
+		},
+		{
+			desc: "a permissions claim path that cannot be parsed is rejected", file: "rbac.json",
+			content: `{"permissionsClaimPath": "scope[x]", ` + endpoints + `}`,
+			wantErr: errInvalidPermissionsClaimPath,
+		},
+		{
+			desc: "roleHeader beside permissionsClaimPath warns that the header is ignored", file: "rbac.json",
+			content: `{"permissionsClaimPath": "scope", "roleHeader": "X-User-Role", ` + endpoints + `}`,
+			perms:   "scope", startLine: "RBAC enabled: mode=permissions, source=scope",
+			warn: "roleHeader is ignored",
+		},
+		{
+			desc: "permissions mode with a roles section warns that the roles are not consulted", file: "rbac.json",
+			content: `{"permissionsClaimPath": "scope", ` +
+				`"roles": [{"name": "a", "permissions": ["orders:read"]}], ` + endpoints + `}`,
+			perms:     "scope",
+			startLine: "RBAC enabled: mode=permissions, source=scope",
+			warn:      "roles section is ignored",
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tc.file)
+			require.NoError(t, os.WriteFile(path, []byte(tc.content), 0600))
+
+			ctrl := gomock.NewController(t)
+			metrics := container.NewMockMetrics(ctrl)
+			logger := &mockLogger{}
+
+			config, err := LoadPermissions(path, logger, metrics, nil)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr, "TEST[%d], Failed.\n%s", i, tc.desc)
+				assert.Nil(t, config, "TEST[%d], Failed.\n%s", i, tc.desc)
+
+				return
+			}
+
+			require.NoError(t, err, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.Equal(t, tc.perms, config.PermissionsClaimPath, "TEST[%d], Failed.\n%s", i, tc.desc)
+			assert.Contains(t, logger.infoLogs, tc.startLine, "TEST[%d], Failed.\n%s", i, tc.desc)
+
+			if tc.warn == "" {
+				assert.Empty(t, logger.warnLogs, "TEST[%d], Failed.\n%s", i, tc.desc)
+			} else {
+				require.Len(t, logger.warnLogs, 1, "TEST[%d], Failed.\n%s", i, tc.desc)
+				assert.Contains(t, logger.warnLogs[0], tc.warn, "TEST[%d], Failed.\n%s", i, tc.desc)
+			}
+		})
+	}
+}

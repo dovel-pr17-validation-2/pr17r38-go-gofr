@@ -1,0 +1,1200 @@
+package eventhub
+
+import (
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
+	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.uber.org/mock/gomock"
+	"gofr.dev/pkg/gofr/datasource"
+	"gofr.dev/pkg/gofr/testutil"
+)
+
+// errHealthProbe stands in for whatever the Event Hub SDK returns when the probe fails.
+var errHealthProbe = errors.New("event hub unreachable")
+
+// errPartitionClientUnavailable is what the fake consumer returns instead of a partition client,
+// which is a concrete type it cannot construct.
+var errPartitionClientUnavailable = errors.New("partition client unavailable in tests")
+
+func TestConnect(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	client := New(getTestConfigs())
+
+	mockLogger := NewMockLogger(ctrl)
+
+	mockLogger.EXPECT().Debug("Event Hub connection started using connection string")
+	mockLogger.EXPECT().Debug("Event Hub producer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub container client setup success")
+	mockLogger.EXPECT().Debug("Event Hub blobstore client setup success")
+	mockLogger.EXPECT().Debug("Event Hub consumer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor running successfully").AnyTimes()
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug("Event Hub client initialization complete")
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(NewMockMetrics(ctrl))
+	client.UseTracer(otel.GetTracerProvider().Tracer("gofr-eventhub"))
+
+	client.Connect()
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Event Hub Connection Failed")
+}
+
+func TestConfigValidation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	mockLogger := NewMockLogger(ctrl)
+
+	client := New(Config{})
+
+	client.UseLogger(mockLogger)
+
+	mockLogger.EXPECT().Error("eventhubName cannot be an empty")
+	mockLogger.EXPECT().Error("connectionString cannot be an empty")
+	mockLogger.EXPECT().Error("storageServiceURL cannot be an empty")
+	mockLogger.EXPECT().Error("storageContainerName cannot be an empty")
+	mockLogger.EXPECT().Error("containerConnectionString cannot be an empty")
+
+	client.Connect()
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Config Validation Failed")
+}
+
+func TestConnect_ProducerError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	logs := testutil.StdoutOutputForFunc(func() {
+		cfg := getTestConfigs()
+		cfg.ConnectionString += ";EntityPath=<entity path>"
+
+		client := New(cfg)
+
+		mockLogger := NewMockLogger(ctrl)
+
+		client.UseLogger(mockLogger)
+		client.UseMetrics(NewMockMetrics(ctrl))
+
+		mockLogger.EXPECT().Debug(gomock.Any()).AnyTimes()
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+		mockLogger.EXPECT().Errorf("error occurred while creating producer client %v", gomock.Any())
+
+		client.Connect()
+	})
+
+	require.NotContains(t, logs, "Error")
+}
+
+func TestConnect_ContainerError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	logs := testutil.StdoutOutputForFunc(func() {
+		cfg := getTestConfigs()
+		cfg.ContainerConnectionString += "<entity path>"
+
+		client := New(cfg)
+
+		mockLogger := NewMockLogger(ctrl)
+
+		client.UseLogger(mockLogger)
+		client.UseMetrics(NewMockMetrics(ctrl))
+
+		mockLogger.EXPECT().Debug(gomock.Any()).AnyTimes()
+		mockLogger.EXPECT().Debugf(gomock.Any(), gomock.Any()).AnyTimes()
+
+		mockLogger.EXPECT().Errorf("error occurred while creating container client %v", gomock.Any())
+
+		client.Connect()
+	})
+
+	require.NotContains(t, logs, "Error")
+}
+
+func TestPublish_ClientNotConnected(t *testing.T) {
+	client := New(getTestConfigs())
+
+	err := client.Publish(t.Context(), client.cfg.EventhubName, []byte("my-message"))
+
+	require.ErrorIs(t, err, errClientNotConnected, "Event Hub Publish should fail when producer is not connected")
+}
+
+func TestPublish_FailedInvalidTopic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	client := New(getTestConfigs())
+
+	mockLogger := NewMockLogger(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
+
+	mockLogger.EXPECT().Debug("Event Hub connection started using connection string")
+	mockLogger.EXPECT().Debug("Event Hub producer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub container client setup success")
+	mockLogger.EXPECT().Debug("Event Hub blobstore client setup success")
+	mockLogger.EXPECT().Debug("Event Hub consumer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor running successfully").AnyTimes()
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug("Event Hub client initialization complete")
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(mockMetrics)
+
+	client.Connect()
+
+	err := client.Publish(t.Context(), "random topic", []byte("my-message"))
+
+	require.Equal(t, "topic should be same as Event Hub name", err.Error(), "Event Hub Publish Failed Invalid Topic")
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Event Hub Publish Failed Invalid Topic")
+}
+
+func Test_CreateTopic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	client := New(getTestConfigs())
+
+	mockLogger := NewMockLogger(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
+
+	mockLogger.EXPECT().Debug("Event Hub connection started using connection string")
+	mockLogger.EXPECT().Debug("Event Hub producer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub container client setup success")
+	mockLogger.EXPECT().Debug("Event Hub blobstore client setup success")
+	mockLogger.EXPECT().Debug("Event Hub consumer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor running successfully").AnyTimes()
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug("Event Hub client initialization complete")
+	mockLogger.EXPECT().Error("topic creation is not supported in Event Hub")
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(mockMetrics)
+
+	client.Connect()
+
+	err := client.CreateTopic(t.Context(), "random-topic")
+
+	require.NoError(t, err, "Event Hub Topic Creation not allowed failed")
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Event Hub Topic Creation not allowed failed")
+}
+
+func Test_DeleteTopic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	client := New(getTestConfigs())
+
+	mockLogger := NewMockLogger(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
+
+	mockLogger.EXPECT().Debug("Event Hub connection started using connection string")
+	mockLogger.EXPECT().Debug("Event Hub producer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub container client setup success")
+	mockLogger.EXPECT().Debug("Event Hub blobstore client setup success")
+	mockLogger.EXPECT().Debug("Event Hub consumer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor running successfully").AnyTimes()
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug("Event Hub client initialization complete")
+	mockLogger.EXPECT().Error("topic deletion is not supported in Event Hub")
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(mockMetrics)
+
+	client.Connect()
+
+	err := client.DeleteTopic(t.Context(), "random-topic")
+
+	require.NoError(t, err, "Event Hub Topic Deletion not allowed failed")
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Event Hub Topic Deletion not allowed failed")
+}
+
+func Test_HealthCheck(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	client := New(getTestConfigs())
+
+	mockLogger := NewMockLogger(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
+
+	mockLogger.EXPECT().Debug("Event Hub connection started using connection string")
+	mockLogger.EXPECT().Debug("Event Hub producer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub container client setup success")
+	mockLogger.EXPECT().Debug("Event Hub blobstore client setup success")
+	mockLogger.EXPECT().Debug("Event Hub consumer client setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor setup success")
+	mockLogger.EXPECT().Debug("Event Hub processor running successfully").AnyTimes()
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug("Event Hub client initialization complete")
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(mockMetrics)
+
+	client.Connect()
+
+	// getTestConfigs points at "<your-namespace>.servicebus.windows.net", which is not a legal
+	// hostname and so can never resolve -- the probe fails the same way on a runner with or
+	// without network access.
+	start := time.Now()
+
+	health := client.Health()
+
+	elapsed := time.Since(start)
+
+	// The connectivity probe must stay bounded. Without that bound a health endpoint backed by an
+	// unreachable namespace blocks on the SDK's own retry schedule, which is what makes a liveness
+	// probe time out instead of answering. The assertion allows 2x eventHubPropsTimeout rather than
+	// the timeout itself: the point is that the probe returns on its own deadline instead of the
+	// SDK's, and a margin that tight would flake on a loaded runner. Measured, it returns in 1x.
+	require.Less(t, elapsed, 2*eventHubPropsTimeout,
+		"Health must return within 2x eventHubPropsTimeout (%v), took %v", 2*eventHubPropsTimeout, elapsed)
+
+	require.Equal(t, datasource.StatusDown, health.Status, "Event Hub health should be down when the namespace is unreachable")
+	require.Equal(t, "EVENT_HUB", health.Details["backend"])
+	require.Equal(t, client.cfg.EventhubName, health.Details["eventHub"])
+	require.Contains(t, health.Details, "error", "an unreachable Event Hub should report the probe error")
+
+	require.True(t, mockLogger.ctrl.Satisfied(), "Event Hub Health Check Failed")
+}
+
+func getTestConfigs() Config {
+	newWebSocketConnFn := func(ctx context.Context, args azeventhubs.WebSocketConnParams) (net.Conn, error) {
+		opts := &websocket.DialOptions{
+			Subprotocols: []string{"amqp"},
+		}
+
+		wssConn, _, err := websocket.Dial(ctx, args.Host, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		return websocket.NetConn(ctx, wssConn, websocket.MessageBinary), nil
+	}
+
+	// For more details on the configuration refer :
+	// https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/messaging/azeventhubs/consumer_client_test.go
+	return Config{
+		ConnectionString: "Endpoint=sb://<your-namespace>.servicebus.windows.net/;SharedAccessKeyName=<key-" +
+			"name>;SharedAccessKey=<key>",
+		ContainerConnectionString: "DefaultEndpointsProtocol=https;AccountName=<storage-account-name>;AccountKey=" +
+			"SGVsbG8gV29ybGQ=",
+		StorageServiceURL:    "core.windows.net",
+		StorageContainerName: "<storage-account-name>",
+		EventhubName:         "event-hub-name",
+		ConsumerOptions: &azeventhubs.ConsumerClientOptions{
+			RetryOptions: azeventhubs.RetryOptions{},
+		},
+		ProducerOptions: &azeventhubs.ProducerClientOptions{
+			NewWebSocketConn: newWebSocketConnFn,
+		},
+	}
+}
+
+func TestGetEventHubName(t *testing.T) {
+	expectedName := "test-event-hub"
+	client := New(Config{
+		EventhubName: expectedName,
+	})
+
+	require.Equal(t, expectedName, client.GetEventHubName(),
+		"GetEventHubName should return the configured EventhubName")
+}
+
+func TestQuery_Failures(t *testing.T) {
+	testCases := []struct {
+		name          string
+		setupClient   func() *Client
+		query         string
+		expectedError error
+	}{
+		{
+			name: "consumer_not_connected",
+			setupClient: func() *Client {
+				return New(Config{
+					EventhubName: "test-hub",
+				})
+			},
+			query:         "test-hub",
+			expectedError: errClientNotConnected,
+		},
+		{
+			name: "empty_topic",
+			setupClient: func() *Client {
+				client := New(Config{
+					EventhubName: "test-hub",
+				})
+				client.consumer = &azeventhubs.ConsumerClient{}
+
+				return client
+			},
+			query:         "",
+			expectedError: errEmptyTopic,
+		},
+		{
+			name: "topic_mismatch",
+			setupClient: func() *Client {
+				client := New(Config{
+					EventhubName: "test-hub",
+				})
+				client.consumer = &azeventhubs.ConsumerClient{} // Just needs to be non-nil
+
+				return client
+			},
+			query:         "different-hub",
+			expectedError: ErrTopicMismatch,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+
+			client := tc.setupClient()
+			mockLogger := NewMockLogger(ctrl)
+
+			client.UseLogger(mockLogger)
+
+			result, err := client.Query(t.Context(), tc.query)
+
+			require.Nil(t, result, "Result should be nil for failure case: %s", tc.name)
+			require.Equal(t, tc.expectedError, err, "Error should match expected for case: %s", tc.name)
+		})
+	}
+}
+
+func TestQuery_ContextWithDeadline(t *testing.T) {
+	// Test that when context has deadline, we respect it
+	ctrl := gomock.NewController(t)
+
+	client := New(Config{
+		EventhubName: "test-hub",
+	})
+	client.consumer = &azeventhubs.ConsumerClient{} // Just needs to be non-nil
+
+	mockLogger := NewMockLogger(ctrl)
+	client.UseLogger(mockLogger)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	// Execute Query (will fail with ErrTopicMismatch before it gets to the deadline handling)
+	_, err := client.Query(ctx, "different-hub")
+
+	// Verify it failed for the right reason
+	require.Equal(t, ErrTopicMismatch, err)
+	require.True(t, mockLogger.ctrl.Satisfied())
+}
+
+func Test_ValidConfigs(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := NewMockLogger(ctrl)
+	client := New(Config{})
+	client.UseLogger(mockLogger)
+
+	mockLogger.EXPECT().Error("eventhubName cannot be an empty")
+	mockLogger.EXPECT().Error("connectionString cannot be an empty")
+	mockLogger.EXPECT().Error("storageServiceURL cannot be an empty")
+	mockLogger.EXPECT().Error("storageContainerName cannot be an empty")
+	mockLogger.EXPECT().Error("containerConnectionString cannot be an empty")
+
+	valid := client.validConfigs(Config{})
+
+	require.False(t, valid, "validConfigs should return false for invalid configuration")
+}
+
+func Test_Health(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := NewMockLogger(ctrl)
+	client := New(getTestConfigs())
+	client.UseLogger(mockLogger)
+
+	// Without Connect() the consumer is nil, so the health check should short-circuit to down.
+	health := client.Health()
+
+	require.Equal(t, datasource.StatusDown, health.Status, "Health should be down when the client is not connected")
+	require.Equal(t, "EVENT_HUB", health.Details["backend"])
+	require.Equal(t, client.cfg.EventhubName, health.Details["eventHub"])
+	require.Equal(t, errClientNotConnected.Error(), health.Details["error"])
+	require.NotContains(t, health.Details, "partitionCount", "an unconnected client has no partitions to report")
+}
+
+func TestCreateTopic_ForMigrations(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockLogger := NewMockLogger(ctrl)
+	client := New(getTestConfigs())
+	client.UseLogger(mockLogger)
+
+	err := client.CreateTopic(t.Context(), "gofr_migrations")
+
+	require.NoError(t, err, "CreateTopic should not return an error for 'gofr_migrations'")
+}
+
+func Test_GetEventHubName(t *testing.T) {
+	expectedName := "test-event-hub"
+	client := New(Config{
+		EventhubName: expectedName,
+	})
+
+	actualName := client.GetEventHubName()
+
+	require.Equal(t, expectedName, actualName, "GetEventHubName should return the configured EventhubName")
+}
+
+func TestConnect_ConsumerGroupDefaults(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cfg := getTestConfigs()
+	cfg.ConsumerGroup = ""
+
+	client := New(cfg)
+	mockLogger := NewMockLogger(ctrl)
+
+	mockLogger.EXPECT().Debugf("Using default consumer group: %s", azeventhubs.DefaultConsumerGroup)
+	mockLogger.EXPECT().Debug(gomock.Any()).AnyTimes()
+	mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(NewMockMetrics(ctrl))
+
+	client.Connect()
+
+	require.Equal(t, azeventhubs.DefaultConsumerGroup, client.cfg.ConsumerGroup,
+		"Client should automatically switch to $Default consumer group when config is empty")
+}
+
+func TestConnect_ConsumerGroupProvided(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cfg := getTestConfigs()
+	expectedGroup := "my-custom-group"
+	cfg.ConsumerGroup = expectedGroup
+
+	client := New(cfg)
+	mockLogger := NewMockLogger(ctrl)
+
+	mockLogger.EXPECT().Debugf("Using provided consumer group: %s", expectedGroup)
+	mockLogger.EXPECT().Debug(gomock.Any()).AnyTimes()
+	mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any()).AnyTimes()
+
+	client.UseLogger(mockLogger)
+	client.UseMetrics(NewMockMetrics(ctrl))
+
+	client.Connect()
+
+	require.Equal(t, expectedGroup, client.cfg.ConsumerGroup, "Client should respect the provided consumer group")
+}
+
+// mockConsumerClient is a hand-written stand-in for *azeventhubs.ConsumerClient, in the same
+// shape as the SQS client's mockSQSClient: the call under test is scripted through a func field
+// and the others answer with a fixed value. Close reports success; NewPartitionClient reports an
+// error, for the reason given on it below.
+type mockConsumerClient struct {
+	getPropsFunc func(ctx context.Context,
+		options *azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error)
+	// closeErr is what Close reports.
+	closeErr error
+	// partitionCalls records every NewPartitionClient request, so tests can assert which partitions
+	// were opened and with which start position.
+	partitionCalls []partitionCall
+}
+
+// partitionCall is one recorded NewPartitionClient request.
+type partitionCall struct {
+	partitionID   string
+	startPosition azeventhubs.StartPosition
+}
+
+func (m *mockConsumerClient) GetEventHubProperties(ctx context.Context,
+	options *azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+	if m.getPropsFunc != nil {
+		return m.getPropsFunc(ctx, options)
+	}
+
+	return azeventhubs.EventHubProperties{}, nil
+}
+
+// NewPartitionClient returns an error rather than (nil, nil). The concrete return type can be
+// constructed -- &azeventhubs.PartitionClient{} compiles -- but not into anything usable: every
+// field is unexported, so ReceiveEvents nil-derefs on it. And handing back a nil client would
+// nil-deref on the deferred Close in the first test that reached tryReadFromPartition.
+func (m *mockConsumerClient) NewPartitionClient(partitionID string,
+	options *azeventhubs.PartitionClientOptions) (*azeventhubs.PartitionClient, error) {
+	m.partitionCalls = append(m.partitionCalls, partitionCall{partitionID: partitionID, startPosition: options.StartPosition})
+
+	return nil, errPartitionClientUnavailable
+}
+
+func (m *mockConsumerClient) Close(context.Context) error { return m.closeErr }
+
+// newHealthTestClient returns a client that looks connected to Health without a live namespace.
+func newHealthTestClient(t *testing.T, consumer consumerClient) *Client {
+	t.Helper()
+
+	client := New(getTestConfigs())
+	client.UseLogger(NewMockLogger(gomock.NewController(t)))
+	client.consumer = consumer
+
+	return client
+}
+
+// Test_Health_Connected covers the only branch that reports the backend as usable. Nothing in
+// the down paths can reach it, so without a stubbed consumer StatusUp and partitionCount are
+// never executed by the suite at all.
+func Test_Health_Connected(t *testing.T) {
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			return azeventhubs.EventHubProperties{
+				Name:         "event-hub-name",
+				PartitionIDs: []string{"0", "1", "2", "3"},
+			}, nil
+		},
+	})
+
+	health := client.Health()
+
+	require.Equal(t, datasource.StatusUp, health.Status, "a reachable Event Hub must report up")
+	require.Equal(t, "EVENT_HUB", health.Details["backend"])
+	require.Equal(t, client.cfg.EventhubName, health.Details["eventHub"])
+	require.Equal(t, 4, health.Details["partitionCount"], "partitionCount must be the number of partitions reported")
+	require.NotContains(t, health.Details, "error", "a healthy Event Hub must not report an error")
+}
+
+// Test_Health_ProbeError pins the message an operator actually reads when the probe fails. The
+// live-namespace test below can only ever produce "context deadline exceeded", so the error is
+// passed through verbatim only here.
+func Test_Health_ProbeError(t *testing.T) {
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			return azeventhubs.EventHubProperties{}, errHealthProbe
+		},
+	})
+
+	health := client.Health()
+
+	require.Equal(t, datasource.StatusDown, health.Status, "a failing probe must report down")
+	require.Equal(t, errHealthProbe.Error(), health.Details["error"], "the probe error must reach the caller verbatim")
+	require.NotContains(t, health.Details, "partitionCount", "a failed probe has no partition count to report")
+}
+
+// Test_Health_NotConnectedDoesNotProbe pins the short-circuit itself: an unconnected client must
+// report down without dialing, so a probe on a dead pod costs nothing and cannot block.
+func Test_Health_NotConnectedDoesNotProbe(t *testing.T) {
+	// A nil consumer, not a scripted mock. There is no seam that can observe a call which must not
+	// happen -- a mock passed here is discarded by the nil assignment, so its t.Error could never
+	// fire. If the short-circuit is removed, Health calls GetEventHubProperties on a nil interface
+	// and this test panics; that is the failure signal.
+	client := newHealthTestClient(t, nil)
+
+	health := client.Health()
+
+	require.Equal(t, datasource.StatusDown, health.Status)
+	require.Equal(t, errClientNotConnected.Error(), health.Details["error"])
+}
+
+// Test_Health_BoundsAProbeThatIgnoresContext is the case the Azure SDK actually creates.
+// GetEventHubProperties passes context.Background() to the AMQP round-trip, so handing our
+// deadline to the SDK does not bound it; only selecting on the deadline ourselves does. The fake
+// here blocks without ever reading ctx, which is what the SDK does once a management link exists
+// and the broker stops answering.
+//
+// Without probeWithin's select this test does not fail -- it hangs until the go test timeout.
+func Test_Health_BoundsAProbeThatIgnoresContext(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			<-release
+
+			return azeventhubs.EventHubProperties{}, nil
+		},
+	})
+
+	start := time.Now()
+	health := client.Health()
+	elapsed := time.Since(start)
+
+	require.Less(t, elapsed, 2*eventHubPropsTimeout,
+		"Health must return on its own deadline even when the probe ignores the context, took %v", elapsed)
+	require.Equal(t, datasource.StatusDown, health.Status, "an unanswered probe must report down")
+	require.Equal(t, errProbeInFlight.Error(), health.Details["error"],
+		"a caller whose deadline expires while the probe is still parked must report the in-flight probe, not a nil error")
+	require.NotContains(t, health.Details, "partitionCount", "an unanswered probe has no partition count")
+}
+
+// Test_Health_PartitionCountIsTheRealCount pins partitionCount to the length the probe reported.
+// The only other connected test uses four partitions, so a mutation replacing len(props.PartitionIDs)
+// with the constant 4 -- or wrapping the assignment in a len > 0 guard -- passed the whole suite.
+func Test_Health_PartitionCountIsTheRealCount(t *testing.T) {
+	for _, partitions := range [][]string{{}, {"0"}, {"0", "1", "2"}} {
+		client := newHealthTestClient(t, &mockConsumerClient{
+			getPropsFunc: func(context.Context,
+				*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+				return azeventhubs.EventHubProperties{PartitionIDs: partitions}, nil
+			},
+		})
+
+		health := client.Health()
+
+		require.Equal(t, datasource.StatusUp, health.Status)
+		require.Equal(t, len(partitions), health.Details["partitionCount"],
+			"partitionCount must be the reported count, including zero")
+	}
+}
+
+// Test_Health_ProbeDeadlineIsTwoSeconds pins the deadline itself. The elapsed-time assertion in
+// Test_HealthCheck is bounded by 2*eventHubPropsTimeout, so both the deadline and the bound move
+// together and raising the constant to 30s passes. This reads the deadline the probe was actually
+// given and compares it against a literal, so the constant cannot drift unnoticed -- and it costs
+// no wall clock.
+func Test_Health_ProbeDeadlineIsTwoSeconds(t *testing.T) {
+	var (
+		gotDeadline bool
+		remaining   time.Duration
+	)
+
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(ctx context.Context,
+			_ *azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			deadline, ok := ctx.Deadline()
+			gotDeadline = ok
+			remaining = time.Until(deadline)
+
+			return azeventhubs.EventHubProperties{}, nil
+		},
+	})
+
+	client.Health()
+
+	require.True(t, gotDeadline, "the probe must be given a deadline")
+	require.Greater(t, remaining, 1500*time.Millisecond, "deadline is shorter than expected, got %v", remaining)
+	require.LessOrEqual(t, remaining, 2*time.Second, "deadline is longer than expected, got %v", remaining)
+}
+
+// Test_Health_ParkedProbeIsCappedAtOne proves a broker that accepts the probe but never answers
+// cannot leak a goroutine per health poll. probeWithin returns on each caller's own deadline while
+// the SDK call stays parked (see Test_Health_BoundsAProbeThatIgnoresContext); without the cap,
+// every concurrent poll would strand another SDK call -- an unbounded leak on the hot health path.
+// The fake blocks in GetEventHubProperties without reading ctx -- what the SDK does once a
+// management link exists -- so once one probe is parked, no number of overlapping polls may enter
+// the fake a second time. Drop the singleflight share so each poll spawns its own probe and
+// callCount climbs past one: this goes red.
+func Test_Health_ParkedProbeIsCappedAtOne(t *testing.T) {
+	release := make(chan struct{})
+
+	var callCount int32
+
+	entered := make(chan struct{}, 1)
+
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			atomic.AddInt32(&callCount, 1)
+
+			select { // signal the first entry without blocking later ones
+			case entered <- struct{}{}:
+			default:
+			}
+
+			<-release
+
+			return azeventhubs.EventHubProperties{}, nil
+		},
+	})
+
+	// Fire a burst of overlapping polls; the first parks a probe and the rest must collapse onto it.
+	var wg sync.WaitGroup
+
+	for range 5 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			client.Health()
+		}()
+	}
+
+	<-entered // one probe is now parked in the fake
+
+	// While it stays parked, no overlapping poll may enter the fake a second time.
+	require.Never(t, func() bool { return atomic.LoadInt32(&callCount) > 1 },
+		300*time.Millisecond, 20*time.Millisecond,
+		"only one SDK probe may run while one is parked; more means a goroutine leaks per poll")
+
+	close(release)
+	wg.Wait()
+
+	require.Equal(t, int32(1), atomic.LoadInt32(&callCount),
+		"the SDK probe must run at most once while one is still parked; more means a goroutine leaks per poll")
+}
+
+// Test_Health_ProbeRecoversAfterParkedCallReturns pins the release half of the cap: once a parked
+// probe's SDK call finally returns, the lock must free so the next poll runs a fresh probe rather
+// than stay wedged on errProbeInFlight forever. Drop the Unlock in probeWithin and a client that
+// probed once can never report up again -- a permanent false DOWN that the cap test alone does not
+// catch, because it never lets its parked probe return.
+func Test_Health_ProbeRecoversAfterParkedCallReturns(t *testing.T) {
+	release := make(chan struct{})
+
+	var calls int32
+
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				<-release // the first probe parks until released; later probes answer immediately
+			}
+
+			return azeventhubs.EventHubProperties{PartitionIDs: []string{"0"}}, nil
+		},
+	})
+
+	// First poll parks the probe and returns down on the deadline.
+	require.Equal(t, datasource.StatusDown, client.Health().Status)
+
+	// Let the parked probe finish. Its goroutine must release the lock as it returns.
+	close(release)
+
+	// A subsequent poll must therefore be able to run a fresh probe and report up. Eventually,
+	// because the release races the parked goroutine's return by a hair.
+	require.Eventually(t, func() bool {
+		return client.Health().Status == datasource.StatusUp
+	}, 5*time.Second, 20*time.Millisecond,
+		"probe must recover once the parked call returns and releases the lock")
+}
+
+// Test_Health_ConcurrentPollsOnHealthyBroker guards the review's blocking concern: capping probes
+// must not turn a healthy broker DOWN for a concurrent poller. /.well-known/health is an ordinary
+// HTTP handler, so Go serves overlapping pollers (k8s liveness + readiness, a load balancer plus a
+// monitor) on their own goroutines. A healthy probe is milliseconds but not instant, so two polls
+// can overlap; both must see UP. Rejecting the second caller with errProbeInFlight (the pre-share
+// TryLock design) makes this go red with up=1.
+func Test_Health_ConcurrentPollsOnHealthyBroker(t *testing.T) {
+	client := newHealthTestClient(t, &mockConsumerClient{
+		getPropsFunc: func(context.Context,
+			*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+			time.Sleep(100 * time.Millisecond) // healthy, but not instant
+
+			return azeventhubs.EventHubProperties{PartitionIDs: []string{"0"}}, nil
+		},
+	})
+
+	var (
+		wg    sync.WaitGroup
+		up    int32
+		start = make(chan struct{})
+	)
+
+	for range 2 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			<-start
+
+			if client.Health().Status == datasource.StatusUp {
+				atomic.AddInt32(&up, 1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Equal(t, int32(2), atomic.LoadInt32(&up),
+		"a healthy broker must report UP to every concurrent poller")
+}
+
+// errConsumerClose stands in for whatever the SDK returns when closing the consumer fails.
+var errConsumerClose = errors.New("consumer close failed")
+
+// propsFunc returns a GetEventHubProperties stub that reports the given partitions and error.
+func propsFunc(partitionIDs []string, err error) func(context.Context,
+	*azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+	return func(context.Context, *azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error) {
+		return azeventhubs.EventHubProperties{PartitionIDs: partitionIDs}, err
+	}
+}
+
+// newTestProducer builds a producer against the unresolvable test namespace. Construction does not
+// dial, so this needs no network; every operation that does dial fails.
+func newTestProducer(t *testing.T) *azeventhubs.ProducerClient {
+	t.Helper()
+
+	cfg := getTestConfigs()
+
+	producer, err := azeventhubs.NewProducerClientFromConnectionString(cfg.ConnectionString, cfg.EventhubName, cfg.ProducerOptions)
+	require.NoError(t, err)
+
+	return producer
+}
+
+func TestSubscribe_NotConnected(t *testing.T) {
+	testCases := []struct {
+		name      string
+		producer  *azeventhubs.ProducerClient
+		consumer  consumerClient
+		processor *azeventhubs.Processor
+	}{
+		{
+			name:      "producer_missing",
+			consumer:  &mockConsumerClient{},
+			processor: &azeventhubs.Processor{},
+		},
+		{
+			name:      "consumer_missing",
+			producer:  &azeventhubs.ProducerClient{},
+			processor: &azeventhubs.Processor{},
+		},
+		{
+			name:     "processor_missing",
+			producer: &azeventhubs.ProducerClient{},
+			consumer: &mockConsumerClient{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := New(getTestConfigs())
+			client.producer = tc.producer
+			client.consumer = tc.consumer
+			client.processor = tc.processor
+
+			msg, err := client.Subscribe(t.Context(), client.cfg.EventhubName)
+
+			require.Nil(t, msg)
+			require.ErrorIs(t, err, errClientNotConnected)
+		})
+	}
+}
+
+// TestSubscribe_DirectConsumerFallback drives Subscribe down the fallback path: a zero-value
+// processor never has a partition client ready, so with a canceled context NextPartitionClient
+// returns nil and Subscribe reads from the consumer directly. The fake consumer cannot hand back a
+// usable partition client, so each partition read fails and is skipped.
+func TestSubscribe_DirectConsumerFallback(t *testing.T) {
+	latest := azeventhubs.StartPosition{Latest: boolPtr(true)}
+
+	testCases := []struct {
+		name          string
+		consumer      *mockConsumerClient
+		setupMocks    func(logger *MockLogger)
+		expectedCalls []partitionCall
+		expectedError error
+	}{
+		{
+			name:     "properties_error",
+			consumer: &mockConsumerClient{getPropsFunc: propsFunc(nil, errHealthProbe)},
+			setupMocks: func(logger *MockLogger) {
+				logger.EXPECT().Errorf("Failed to get Event Hub properties: %v", errHealthProbe)
+			},
+			expectedError: errHealthProbe,
+		},
+		{
+			name:          "no_partitions",
+			consumer:      &mockConsumerClient{getPropsFunc: propsFunc(nil, nil)},
+			setupMocks:    func(*MockLogger) {},
+			expectedError: nil,
+		},
+		{
+			name:     "every_partition_fails_to_open",
+			consumer: &mockConsumerClient{getPropsFunc: propsFunc([]string{"0", "1"}, nil)},
+			setupMocks: func(logger *MockLogger) {
+				logger.EXPECT().Debugf("Error reading from partition %s: %v", "0", errPartitionClientUnavailable)
+				logger.EXPECT().Debugf("Error reading from partition %s: %v", "1", errPartitionClientUnavailable)
+			},
+			expectedCalls: []partitionCall{
+				{partitionID: "0", startPosition: latest},
+				{partitionID: "1", startPosition: latest},
+			},
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockLogger := NewMockLogger(ctrl)
+			tc.setupMocks(mockLogger)
+
+			client := New(getTestConfigs())
+			client.UseLogger(mockLogger)
+			client.producer = &azeventhubs.ProducerClient{}
+			client.processor = &azeventhubs.Processor{}
+			client.consumer = tc.consumer
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			msg, err := client.Subscribe(ctx, client.cfg.EventhubName)
+
+			require.Nil(t, msg)
+			require.ErrorIs(t, err, tc.expectedError)
+			require.Equal(t, tc.expectedCalls, tc.consumer.partitionCalls)
+		})
+	}
+}
+
+func TestGetReceiveTimeout(t *testing.T) {
+	testCases := []struct {
+		name            string
+		consumer        consumerClient
+		expectedBasic   bool
+		expectedTimeout time.Duration
+	}{
+		{
+			name:            "not_connected",
+			consumer:        nil,
+			expectedBasic:   false,
+			expectedTimeout: time.Second,
+		},
+		{
+			name:            "properties_error",
+			consumer:        &mockConsumerClient{getPropsFunc: propsFunc(nil, errHealthProbe)},
+			expectedBasic:   false,
+			expectedTimeout: time.Second,
+		},
+		{
+			name:            "basic_tier_partition_count",
+			consumer:        &mockConsumerClient{getPropsFunc: propsFunc([]string{"0", "1"}, nil)},
+			expectedBasic:   true,
+			expectedTimeout: basicTierReceiveTimeout,
+		},
+		{
+			name:            "standard_tier_partition_count",
+			consumer:        &mockConsumerClient{getPropsFunc: propsFunc([]string{"0", "1", "2", "3"}, nil)},
+			expectedBasic:   false,
+			expectedTimeout: time.Second,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := New(getTestConfigs())
+			client.consumer = tc.consumer
+
+			require.Equal(t, tc.expectedBasic, client.isLikelyBasicTier())
+			require.Equal(t, tc.expectedTimeout, client.getReceiveTimeout())
+		})
+	}
+}
+
+func TestPublish(t *testing.T) {
+	testCases := []struct {
+		name          string
+		topic         string
+		setupMocks    func(logger *MockLogger, metrics *MockMetrics)
+		expectedError error
+	}{
+		{
+			name:          "topic_mismatch",
+			topic:         "other-topic",
+			setupMocks:    func(*MockLogger, *MockMetrics) {},
+			expectedError: ErrTopicMismatch,
+		},
+		{
+			// The namespace is unreachable and the context is already canceled, so the SDK gives up
+			// acquiring a link before a batch can be created.
+			name:  "batch_creation_fails",
+			topic: "event-hub-name",
+			setupMocks: func(logger *MockLogger, metrics *MockMetrics) {
+				metrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_publish_total_count", "topic", "event-hub-name")
+				logger.EXPECT().Errorf("failed to create event batch %v", gomock.Any())
+			},
+			expectedError: context.Canceled,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockLogger := NewMockLogger(ctrl)
+			mockMetrics := NewMockMetrics(ctrl)
+			tc.setupMocks(mockLogger, mockMetrics)
+
+			client := New(getTestConfigs())
+			client.UseLogger(mockLogger)
+			client.UseMetrics(mockMetrics)
+			client.producer = newTestProducer(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			err := client.Publish(ctx, tc.topic, []byte("my-message"))
+
+			require.ErrorIs(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestQuery_ReadMessages(t *testing.T) {
+	earliest := azeventhubs.StartPosition{Earliest: boolPtr(true)}
+	latest := azeventhubs.StartPosition{Latest: boolPtr(true)}
+
+	testCases := []struct {
+		name          string
+		consumer      *mockConsumerClient
+		ctx           func(t *testing.T) context.Context
+		args          []any
+		expectedCalls []partitionCall
+		expectedError error
+	}{
+		{
+			name:          "properties_error",
+			consumer:      &mockConsumerClient{getPropsFunc: propsFunc(nil, errHealthProbe)},
+			ctx:           (*testing.T).Context,
+			expectedError: errHealthProbe,
+		},
+		{
+			name:     "default_start_position_on_every_partition",
+			consumer: &mockConsumerClient{getPropsFunc: propsFunc([]string{"0", "1"}, nil)},
+			ctx:      (*testing.T).Context,
+			expectedCalls: []partitionCall{
+				{partitionID: "0", startPosition: earliest},
+				{partitionID: "1", startPosition: earliest},
+			},
+		},
+		{
+			name:     "caller_deadline_and_latest_start_position",
+			consumer: &mockConsumerClient{getPropsFunc: propsFunc([]string{"0"}, nil)},
+			ctx: func(t *testing.T) context.Context {
+				t.Helper()
+
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				t.Cleanup(cancel)
+
+				return ctx
+			},
+			args: []any{"latest", 5},
+			expectedCalls: []partitionCall{
+				{partitionID: "0", startPosition: latest},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := New(Config{EventhubName: "test-hub"})
+			client.consumer = tc.consumer
+
+			result, err := client.Query(tc.ctx(t), "test-hub", tc.args...)
+
+			require.Nil(t, result, "no partition can be read, so nothing is returned")
+			require.ErrorIs(t, err, tc.expectedError)
+			require.Equal(t, tc.expectedCalls, tc.consumer.partitionCalls)
+		})
+	}
+}
+
+func TestClose(t *testing.T) {
+	testCases := []struct {
+		name          string
+		producer      func(t *testing.T) *azeventhubs.ProducerClient
+		consumer      consumerClient
+		processor     func(t *testing.T) (context.Context, context.CancelFunc)
+		setupMocks    func(logger *MockLogger)
+		expectedError error
+		expectedCtx   error
+	}{
+		{
+			name:          "nothing_to_close",
+			producer:      func(*testing.T) *azeventhubs.ProducerClient { return nil },
+			processor:     withoutProcessorContext,
+			setupMocks:    func(*MockLogger) {},
+			expectedError: nil,
+			expectedCtx:   nil,
+		},
+		{
+			name:          "producer_and_consumer_closed",
+			producer:      newTestProducer,
+			consumer:      &mockConsumerClient{},
+			processor:     withoutProcessorContext,
+			setupMocks:    func(*MockLogger) {},
+			expectedError: nil,
+			expectedCtx:   nil,
+		},
+		{
+			name:      "consumer_close_error",
+			producer:  func(*testing.T) *azeventhubs.ProducerClient { return nil },
+			consumer:  &mockConsumerClient{closeErr: errConsumerClose},
+			processor: withoutProcessorContext,
+			setupMocks: func(logger *MockLogger) {
+				logger.EXPECT().Errorf("failed to close Event Hub consumer: %v", errConsumerClose)
+			},
+			expectedError: errConsumerClose,
+			expectedCtx:   nil,
+		},
+		{
+			name:      "processor_context_canceled",
+			producer:  func(*testing.T) *azeventhubs.ProducerClient { return nil },
+			consumer:  &mockConsumerClient{},
+			processor: withProcessorContext,
+			setupMocks: func(logger *MockLogger) {
+				logger.EXPECT().Debug("Event Hub processor context canceled")
+			},
+			expectedError: nil,
+			expectedCtx:   context.Canceled,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockLogger := NewMockLogger(ctrl)
+			tc.setupMocks(mockLogger)
+
+			client := New(getTestConfigs())
+			client.UseLogger(mockLogger)
+			client.producer = tc.producer(t)
+			client.consumer = tc.consumer
+
+			processorCtx, processorCancel := tc.processor(t)
+			client.processorCtx = processorCancel
+
+			err := client.Close()
+
+			require.ErrorIs(t, err, tc.expectedError)
+			require.Equal(t, tc.expectedCtx, processorCtx.Err())
+		})
+	}
+}
+
+// withoutProcessorContext models a client that never started a processor.
+func withoutProcessorContext(*testing.T) (context.Context, context.CancelFunc) {
+	return context.Background(), nil
+}
+
+// withProcessorContext models a client whose processor is running under a cancelable context.
+func withProcessorContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	return ctx, cancel
+}

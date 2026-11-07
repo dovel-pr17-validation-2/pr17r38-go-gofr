@@ -1,0 +1,385 @@
+package remotelogger
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"slices"
+	"sync"
+	"time"
+
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/service"
+)
+
+const (
+	requestTimeout = 5 * time.Second
+	// ANSI color codes for terminal output.
+	colorBlue   = 34  // For successful responses (2xx)
+	colorYellow = 220 // For client errors (4xx)
+	colorRed    = 202 // For server errors (5xx)
+)
+
+// httpDebugMsg represents a structured HTTP debug log entry.
+// It implements PrettyPrint for colored output and json.Marshaler for JSON logs.
+type httpDebugMsg struct {
+	CorrelationID string `json:"correlation_id"`
+	ResponseCode  int    `json:"response_code"`
+	ResponseTime  int64  `json:"response_time_us"`
+	HTTPMethod    string `json:"http_method"`
+	URI           string `json:"uri"`
+}
+
+func (m httpDebugMsg) PrettyPrint(w io.Writer) {
+	colorCode := colorForResponseCode(m.ResponseCode)
+	fmt.Fprintf(w,
+		"\u001B[38;5;8m%s \u001B[38;5;%dm%-6d\u001B[0m %8dμs\u001B[0m %s %s\n",
+		m.CorrelationID,
+		colorCode,
+		m.ResponseCode,
+		m.ResponseTime,
+		m.HTTPMethod,
+		m.URI,
+	)
+}
+
+func (m httpDebugMsg) MarshalJSON() ([]byte, error) {
+	type alias httpDebugMsg
+	return json.Marshal(alias(m))
+}
+
+// httpLogFilter filters HTTP logs from remote logger to reduce noise.
+type httpLogFilter struct {
+	logging.Logger
+	mu                 sync.Mutex
+	firstSuccessfulHit bool
+	initLogged         bool
+}
+
+// Log implements a simplified filtering strategy with consistent formatting.
+func (f *httpLogFilter) Log(args ...any) {
+	if len(args) == 0 || args[0] == nil {
+		f.Logger.Log(args...)
+		return
+	}
+
+	// Handle HTTP logs.
+	httpLog, ok := args[0].(*service.Log)
+	if !ok {
+		f.Logger.Log(args...)
+		return
+	}
+
+	f.handleHTTPLog(httpLog, args)
+}
+
+func (f *httpLogFilter) handleHTTPLog(httpLog *service.Log, args []any) {
+	// Log initialization message if not already logged
+	f.mu.Lock()
+	notLoggedYet := !f.initLogged
+
+	if notLoggedYet {
+		f.initLogged = true
+	}
+
+	f.mu.Unlock()
+
+	if notLoggedYet {
+		f.Logger.Infof("Initializing remote logger connection to %s", httpLog.URI)
+	}
+
+	isSuccessful := httpLog.ResponseCode >= 200 && httpLog.ResponseCode < 300
+
+	f.mu.Lock()
+	isFirstHit := !f.firstSuccessfulHit
+	f.mu.Unlock()
+
+	switch {
+	// First successful hit - log at INFO level
+	case isSuccessful && isFirstHit:
+		f.mu.Lock()
+		f.firstSuccessfulHit = true
+		f.mu.Unlock()
+		f.Logger.Log(args...)
+
+	// Subsequent successful hits - log at DEBUG level with consistent format
+	case isSuccessful:
+		msg := httpDebugMsg{
+			CorrelationID: httpLog.CorrelationID,
+			ResponseCode:  httpLog.ResponseCode,
+			ResponseTime:  httpLog.ResponseTime,
+			HTTPMethod:    httpLog.HTTPMethod,
+			URI:           httpLog.URI,
+		}
+		f.Logger.Debug(msg)
+
+	// Error responses - pass through to original logger
+	default:
+		f.Logger.Log(args...)
+	}
+}
+
+func colorForResponseCode(status int) int {
+	switch {
+	case status >= 200 && status < 300:
+		return colorBlue
+	case status >= 400 && status < 500:
+		return colorYellow
+	case status >= 500 && status < 600:
+		return colorRed
+	}
+
+	return 0
+}
+
+/*
+New creates a new RemoteLogger instance with the provided level, remote configuration URL, and level fetch interval.
+The remote configuration URL is expected to be a JSON endpoint that returns the desired log level for the service.
+The level fetch interval determines how often the logger checks for updates to the remote configuration.
+*/
+func New(level logging.Level, remoteConfigURL string, loggerFetchInterval time.Duration) logging.Logger {
+	base := logging.NewLogger(level)
+
+	l := &remoteLogger{
+		remoteURL:          remoteConfigURL,
+		Logger:             base,
+		levelFetchInterval: loggerFetchInterval,
+		currentLevel:       level,
+	}
+
+	if e, ok := base.(logEnabler); ok {
+		l.enabler = e
+	}
+
+	// Resolved once, here, for the same reason as enabler: the embedded logger is
+	// assigned in New and never reassigned, so a per-request assertion would pay
+	// for a question whose answer cannot change.
+	if e, ok := base.(entryLogger); ok {
+		l.entries = e
+	}
+
+	if remoteConfigURL != "" {
+		go l.UpdateLogLevel()
+	}
+
+	return l
+}
+
+// entryLogger is the optional interface a logger implements when it can take an
+// already-built entry directly, without the one-element slice a variadic Log
+// allocates to carry it. It mirrors the middleware's own contract.
+type entryLogger interface {
+	LogEntry(any)
+	ErrorEntry(any)
+}
+
+// logEnabler is the optional interface a logger implements when it can report,
+// without being handed an entry, whether an entry written through Log would be
+// emitted. It mirrors the middleware's own contract.
+type logEnabler interface {
+	LogEnabled() bool
+}
+
+type remoteLogger struct {
+	remoteURL          string
+	levelFetchInterval time.Duration
+	mu                 sync.RWMutex
+	currentLevel       logging.Level
+	// enabler is the embedded logger's LogEnabled, resolved once in New. nil
+	// when the embedded logger does not implement it.
+	enabler logEnabler
+	// entries is the embedded logger's single-value log path, resolved once in
+	// New. nil when the embedded logger does not implement it.
+	entries entryLogger
+	logging.Logger
+}
+
+// LogEntry forwards a single pre-built entry to the embedded logger's
+// allocation-free path, bypassing the slice a variadic Log allocates.
+//
+// Forwarding is safe with respect to the dynamic level: this type does not gate
+// on currentLevel, it PUSHES level changes down with ChangeLevel, and the
+// embedded logger applies them to its own atomic before deciding. So an entry
+// routed this way passes exactly the same gate as one routed through Log.
+//
+// An embedded logger without the fast path leaves entries nil and falls back to
+// Log, which is what every external Logger implementation will do.
+func (r *remoteLogger) LogEntry(entry any) {
+	if r.entries == nil {
+		r.Log(entry)
+
+		return
+	}
+
+	r.entries.LogEntry(entry)
+}
+
+// ErrorEntry forwards a single pre-built entry at ERROR, mirroring LogEntry.
+func (r *remoteLogger) ErrorEntry(entry any) {
+	if r.entries == nil {
+		r.Error(entry)
+
+		return
+	}
+
+	r.entries.ErrorEntry(entry)
+}
+
+// LogEnabled reports whether an entry written through Log survives the level
+// currently in force.
+//
+// The embedded logger is the authority: this type only tracks currentLevel so
+// it can push changes down via ChangeLevel, and the logger applies them
+// immediately, so asking the logger itself is both correct and current.
+//
+// No lock is taken. r.mu guards currentLevel, which this method never reads,
+// and ChangeLevel is called outside r.mu anyway -- so an RLock here would give
+// no ordering against a level change while adding a process-wide atomic to
+// every request. The gate is advisory: the worst a racing level change can do
+// is build one entry that is then discarded, or skip one at the instant the
+// level is lowered.
+//
+// The embedded logger is assigned once in New and never reassigned, so the
+// logEnabler assertion is resolved there rather than per request. An embedded
+// logger that cannot answer is treated as enabled, which preserves the previous
+// behavior of always building the entry.
+func (r *remoteLogger) LogEnabled() bool {
+	if r.enabler == nil {
+		return true
+	}
+
+	return r.enabler.LogEnabled()
+}
+
+// UpdateLogLevel continuously fetches the log level from the remote configuration URL at the specified interval
+// and updates the underlying log level if it has changed.
+func (r *remoteLogger) UpdateLogLevel() {
+	// Create filtered logger with proper initialization
+	filteredLogger := &httpLogFilter{
+		Logger:             r.Logger,
+		firstSuccessfulHit: false,
+		initLogged:         false,
+	}
+
+	remoteService := service.NewHTTPService(r.remoteURL, filteredLogger, nil)
+
+	r.Infof("Remote logger monitoring initialized with URL: %s, interval: %s",
+		r.remoteURL, r.levelFetchInterval)
+
+	checkAndUpdateLevel := func() {
+		r.mu.RLock()
+		currentLevel := r.currentLevel
+		r.mu.RUnlock()
+
+		newLevel, err := fetchAndUpdateLogLevel(remoteService, currentLevel)
+		if err != nil {
+			r.Warnf("Failed to fetch log level: %v", err)
+			return
+		}
+
+		r.mu.Lock()
+
+		if r.currentLevel != newLevel {
+			oldLevel := r.currentLevel
+			r.currentLevel = newLevel
+			r.mu.Unlock()
+
+			// Announce so the message always passes the gate. The gate is the
+			// level in force when the announcement is written (enabled: msg
+			// level >= current level), and the announcement is written at the
+			// higher endpoint of the transition.
+			//
+			// We order the announcement so the gate is the *lower* endpoint at
+			// the moment we write: when lowering, ChangeLevel first (gate
+			// becomes the new, lower level); when raising, announce first (gate
+			// is still the old, lower level). The higher endpoint always clears
+			// the lower gate, so no transition — including into or out of
+			// FATAL — is silently dropped, while transitions that already
+			// emitted keep the severity they had.
+			if newLevel < oldLevel {
+				r.ChangeLevel(newLevel)
+				logLevelChange(r, oldLevel, newLevel, oldLevel)
+			} else {
+				logLevelChange(r, oldLevel, newLevel, newLevel)
+				r.ChangeLevel(newLevel)
+			}
+		} else {
+			r.mu.Unlock()
+		}
+	}
+
+	// Perform initial check immediately
+	checkAndUpdateLevel()
+
+	// Setup ticker for periodic checks
+	ticker := time.NewTicker(r.levelFetchInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		checkAndUpdateLevel()
+	}
+}
+
+// logLevelChange announces a remote level change. announceLevel is the level to
+// emit the announcement at, chosen by the caller (the higher endpoint of the
+// transition) so it passes the gate in force at the moment of the call (see
+// UpdateLogLevel). A FATAL announceLevel arises for X -> FATAL transitions and
+// is emitted via Errorf: it is the most severe level that is still guaranteed
+// to be visible, and it avoids routing through Fatalf (which would exit the
+// process).
+func logLevelChange(r *remoteLogger, oldLevel, newLevel, announceLevel logging.Level) {
+	message := fmt.Sprintf("LOG_LEVEL updated from %v to %v", oldLevel, newLevel)
+
+	switch announceLevel {
+	case logging.FATAL:
+		r.Errorf("%s", message)
+	case logging.ERROR:
+		r.Errorf("%s", message)
+	case logging.WARN:
+		r.Warnf("%s", message)
+	case logging.NOTICE:
+		r.Noticef("%s", message)
+	case logging.INFO:
+		r.Infof("%s", message)
+	case logging.DEBUG:
+		r.Infof("%s", message) // Using Info for DEBUG to ensure visibility
+	}
+}
+
+func fetchAndUpdateLogLevel(remoteService service.HTTP, currentLevel logging.Level) (logging.Level, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout) // Set timeout for 5 seconds
+	defer cancel()
+
+	resp, err := remoteService.Get(ctx, "", nil)
+	if err != nil {
+		return currentLevel, err
+	}
+	defer resp.Body.Close()
+
+	var response struct {
+		Data struct {
+			ServiceName string `json:"serviceName"`
+			Level       string `json:"logLevel"`
+		} `json:"data"`
+	}
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return currentLevel, err
+	}
+
+	err = json.Unmarshal(responseBody, &response)
+	if err != nil {
+		return currentLevel, err
+	}
+
+	logLevels := []string{"DEBUG", "INFO", "NOTICE", "WARN", "ERROR", "FATAL"}
+
+	if slices.Contains(logLevels, response.Data.Level) && response.Data.ServiceName != "" {
+		newLevel := logging.GetLevelFromString(response.Data.Level)
+		return newLevel, nil
+	}
+
+	return currentLevel, nil
+}

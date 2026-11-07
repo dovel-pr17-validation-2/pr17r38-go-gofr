@@ -1,0 +1,118 @@
+---
+description: "Speed up route matching in GoFr with the opt-in trie router. Set GOFR_ROUTER=trie to make matching cost O(path length) instead of scaling with your route count."
+nextjs:
+  metadata:
+    title: "Routing Performance in GoFr — The Opt-In Trie Router"
+    description: "Speed up route matching in GoFr with the opt-in trie router. Set GOFR_ROUTER=trie to make matching cost O(path length) instead of scaling with your route count."
+---
+
+# Routing Performance
+
+GoFr routes on `gorilla/mux`, which finds a handler by walking the registered routes in order and
+testing each one against the request path. That is O(n) in the number of routes, so a service pays a
+little more per request for every route it adds.
+
+Setting `GOFR_ROUTER=trie` swaps the matching step for a segment trie, making it O(path length) —
+flat as the route table grows. Everything else is unchanged: `mux` is still the route registry, and
+`mux` still makes the final decision about which route matches.
+
+```bash
+# configs/.env
+GOFR_ROUTER=trie
+```
+
+It is **off by default**. Leave it unset and your service behaves exactly as it always has.
+
+## Whether it will help you
+
+The win scales with the size of your route table, so it is worth being concrete about where the line
+is. Measured on an Apple M4, with the request hitting the middle of the table:
+
+| Routes | Default (mux) | `GOFR_ROUTER=trie` | Speedup |
+| -----: | ------------: | -----------------: | ------: |
+|      1 |        431 ns |             447 ns |   0.96x |
+|     10 |        506 ns |             461 ns |    1.1x |
+|     50 |       1007 ns |             550 ns |    1.8x |
+|    100 |       1642 ns |             548 ns |    3.0x |
+|    200 |       2918 ns |             515 ns |    5.7x |
+
+The crossover is around 5–10 routes. Below that the trie is marginally slower, so a small service
+gains nothing by turning it on.
+
+Two further caveats worth setting expectations against:
+
+- **Matching is a minority of a request.** The middleware chain — tracing, logging, metrics, CORS —
+  dominates. So end-to-end throughput moves by less than the table above, approaching it only as the
+  route count grows.
+- **The trie also allocates less**, where it used to allocate more. On a 100-route table, per
+  matched request: a static route costs 536 B / 8 allocations against the default matcher's
+  960 B / 12, and a parameterised route 1208 B / 11 against 1264 B / 13. The middleware chain is
+  composed once per route instead of per request, and an empty path-parameter map is no longer
+  stored. This applies to routes registered through the framework (`app.GET`, `app.POST`, ...).
+
+## What stays the same
+
+Routing behavior is unchanged, and that is a property the framework tests for rather than a hope.
+The trie only *narrows* the set of routes worth considering; `mux`'s own `Route.Match` still decides
+every request, so method matching, `{id:[0-9]+}` constraints, header and query matchers, route
+ordering and path cleaning all behave exactly as they do by default. Anything the trie cannot index
+— `PathPrefix` routes, static file handlers, slash-spanning parameters like `{path:.*}` — is handled
+by `mux` directly. Requests that match nothing are handed to `mux` in full.
+
+Path parameters are unaffected: `ctx.PathParam("id")` returns the same values under either
+matcher. `mux.Vars(r)` returns the same values too, with one difference worth knowing: on a route
+that declares no path parameters the trie leaves it `nil` where `mux` returns an empty non-nil map.
+Every read behaves the same -- indexing gives the zero value, `len` is 0, and ranging does nothing --
+but an explicit `mux.Vars(r) != nil` check answers differently.
+
+Middleware registration becomes order-sensitive. Each route's middleware chain is composed once,
+on its first request, and reused, so a middleware registered *after* a route has served does not
+run for that route. Registering everything before starting the server — which is what `app.Run`
+does, and what an application normally does — keeps this invisible. An application that reaches the
+router itself and registers late gets an error in the log saying so rather than a middleware that
+silently never runs.
+
+## The one thing to check in your own code
+
+The trie serves matched requests without going through `mux`'s own `ServeHTTP`, which is what
+populates `mux.CurrentRoute`. If any of your handlers or middleware calls it:
+
+```go
+// Returns nil when GOFR_ROUTER=trie.
+route := mux.CurrentRoute(r)
+tmpl, _ := route.GetPathTemplate()
+```
+
+use GoFr's accessor instead. It resolves the template under both routers, so it is safe to adopt
+before you flip the flag:
+
+```go
+import gofrHTTP "gofr.dev/pkg/gofr/http"
+
+tmpl := gofrHTTP.RouteTemplate(r) // "/users/{id}", or "" if nothing matched
+```
+
+`mux.Vars(r)` keeps working and needs no change for any ordinary read. Only an explicit nil check
+against the map itself differs -- see the note above.
+
+## Confirming which matcher is active
+
+GoFr logs the matcher at startup whenever `GOFR_ROUTER` is set:
+
+```
+INFO  HTTP route matcher: trie
+```
+
+A value it does not recognize falls back to `mux` and says so, so a typo does not cost you the opt-in
+silently:
+
+```
+WARN  unrecognized GOFR_ROUTER value "tri", using the "mux" router; valid values are "mux" and "trie"
+```
+
+## A note on registering routes late
+
+The index is built once, from the routes present when the first request arrives. GoFr registers every
+route during startup, before the server begins accepting requests, so this holds for all framework
+code paths. A route added after the server is already serving would not be indexed — it would still
+be served correctly, via `mux`, just without the speedup.

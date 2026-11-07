@@ -1,0 +1,605 @@
+package exporters
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	metricSdk "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
+
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/testutil"
+	"gofr.dev/pkg/gofr/version"
+)
+
+var errBuilderFailed = errors.New("builder failed")
+
+// TestBuild_appliesCardinalityLimit verifies Build wires cfg.CardinalityLimit
+// into the MeterProvider: recording more distinct attribute sets than the limit
+// collapses the excess into a single overflow series. A ManualReader registered
+// as a custom exporter shares the provider, so it observes the same limit.
+func TestBuild_appliesCardinalityLimit(t *testing.T) {
+	reader := metricSdk.NewManualReader()
+
+	Register("card-test", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return reader, nil
+	})
+
+	limit := 2
+	cfg := Config{AppName: "app", AppVersion: "v1", Exporter: "card-test", CardinalityLimit: &limit}
+
+	shutdown, meter := Build(context.Background(), &cfg, logging.NewMockLogger(logging.ERROR))
+
+	defer func() { _ = shutdown(context.Background()) }()
+
+	counter, err := meter.Int64Counter("card_counter")
+	if err != nil {
+		t.Fatalf("failed to create counter: %v", err)
+	}
+
+	const distinct = 5
+	for i := 0; i < distinct; i++ {
+		counter.Add(context.Background(), 1, metric.WithAttributes(attribute.Int("i", i)))
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect failed: %v", err)
+	}
+
+	points := countDataPoints(t, &rm, "card_counter")
+
+	// limit distinct series are kept; the rest collapse into one overflow series.
+	if points == 0 {
+		t.Fatal("card_counter not found in collected metrics")
+	}
+
+	if points >= distinct || points > limit+1 {
+		t.Errorf("cardinality limit not applied: got %d data points, want <= %d", points, limit+1)
+	}
+}
+
+// TestBuild_unsetCardinalityLimitHonorsSDKEnv pins the other half of the
+// contract: with METRICS_CARDINALITY_LIMIT unset, Build must pass no limit at
+// all. The SDK applies explicit options after OTEL_GO_X_CARDINALITY_LIMIT
+// (sdk/metric config.go newConfig), so any hard-coded WithCardinalityLimit in
+// Build would silently make that variable inert.
+func TestBuild_unsetCardinalityLimitHonorsSDKEnv(t *testing.T) {
+	t.Setenv("OTEL_GO_X_CARDINALITY_LIMIT", "3")
+
+	reader := metricSdk.NewManualReader()
+
+	Register("card-env-test", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return reader, nil
+	})
+
+	cfg := Config{AppName: "app", AppVersion: "v1", Exporter: "card-env-test"}
+
+	shutdown, meter := Build(context.Background(), &cfg, logging.NewMockLogger(logging.ERROR))
+
+	defer func() { _ = shutdown(context.Background()) }()
+
+	counter, err := meter.Int64Counter("card_env_counter")
+	if err != nil {
+		t.Fatalf("failed to create counter: %v", err)
+	}
+
+	const distinct = 10
+	for i := 0; i < distinct; i++ {
+		counter.Add(context.Background(), 1, metric.WithAttributes(attribute.Int("i", i)))
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect failed: %v", err)
+	}
+
+	if points := countDataPoints(t, &rm, "card_env_counter"); points == 0 || points > 3 {
+		t.Errorf("OTEL_GO_X_CARDINALITY_LIMIT=3 not honored with METRICS_CARDINALITY_LIMIT unset: got %d data points", points)
+	}
+}
+
+func countDataPoints(t *testing.T, rm *metricdata.ResourceMetrics, name string) int {
+	t.Helper()
+
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+				return len(sum.DataPoints)
+			}
+		}
+	}
+
+	return 0
+}
+
+func TestBuild(t *testing.T) {
+	Register("build-custom", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return metricSdk.NewManualReader(), nil
+	})
+	Register("build-fail", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return nil, errBuilderFailed
+	})
+
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{"prometheus only when empty", Config{AppName: "app", AppVersion: "v1"}},
+		{"prometheus explicit", Config{AppName: "app", Exporter: "prometheus"}},
+		{"custom push exporter", Config{AppName: "app", Exporter: "build-custom"}},
+		{"unknown exporter falls back to prometheus", Config{AppName: "app", Exporter: "does-not-exist"}},
+		{"failing builder falls back to prometheus", Config{AppName: "app", Exporter: "build-fail"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			shutdown, meter := Build(context.Background(), &tc.cfg, logging.NewMockLogger(logging.INFO))
+
+			if shutdown == nil {
+				t.Fatal("expected non-nil ShutdownFunc")
+			}
+
+			if meter == nil {
+				t.Fatal("expected non-nil Meter")
+			}
+
+			if _, err := meter.Int64Counter("test_counter"); err != nil {
+				t.Errorf("meter should be usable, got error: %v", err)
+			}
+
+			_ = shutdown(context.Background())
+		})
+	}
+}
+
+func TestBuild_missingSubmoduleImportHint(t *testing.T) {
+	cfg := Config{AppName: "app", Exporter: "gcp"} // "gcp" is not blank-imported in this test binary
+
+	out := testutil.StderrOutputForFunc(func() {
+		shutdown, meter := Build(context.Background(), &cfg, logging.NewMockLogger(logging.ERROR))
+		if meter == nil {
+			t.Error("expected a usable meter on fallback")
+		}
+
+		_ = shutdown(context.Background())
+	})
+
+	if !strings.Contains(out, "gofr.dev/pkg/gofr/metrics/exporters/gcp") {
+		t.Errorf("expected the import path in the error, got: %q", out)
+	}
+
+	if !strings.Contains(out, "blank import") {
+		t.Errorf("expected actionable 'blank import' guidance, got: %q", out)
+	}
+}
+
+// unsetServiceNameEnv blanks the variables that can name the service, so a test
+// that sets neither does not pick up whatever the caller's shell exports.
+func unsetServiceNameEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+}
+
+// Google's OTLP ingest maps points onto prometheus_target and rejects any whose
+// "location" or "instance" label is empty, so the resource has to carry a source
+// for both. instance falls back to host.id, which is detected; location can only
+// come from the operator, via the standard OTel environment variable.
+func TestBuildResource_carriesRequiredLabelSources(t *testing.T) {
+	unsetServiceNameEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "location=us-central1")
+
+	// host.id is only detected for push exporters, so select one.
+	res := buildResource(context.Background(), &Config{AppName: "app", Exporter: "otlp"}, logging.NewMockLogger(logging.INFO))
+	if res == nil {
+		t.Fatal("expected a resource")
+	}
+
+	got := map[string]string{}
+	for _, kv := range res.Attributes() {
+		got[string(kv.Key)] = kv.Value.String()
+	}
+
+	if got["location"] != "us-central1" {
+		t.Errorf("location = %q, want %q (OTEL_RESOURCE_ATTRIBUTES must reach the resource)", got["location"], "us-central1")
+	}
+
+	if got["host.id"] == "" {
+		t.Error("host.id is empty; it is the last fallback Google accepts for the required instance label")
+	}
+
+	// The attributes that were already there must survive the merge.
+	if got["service.name"] != "app" {
+		t.Errorf("service.name = %q, want %q", got["service.name"], "app")
+	}
+
+	if got["framework_version"] == "" {
+		t.Error("framework_version was dropped")
+	}
+}
+
+// A registered detector must only run for the exporter it belongs to, so that a
+// Prometheus-only app never reaches for a cloud metadata server.
+func TestBuildResource_detectorRunsOnlyForItsExporter(t *testing.T) {
+	var called bool
+
+	// A non-empty schema URL that differs from the SDK's own is what a real vendor
+	// detector supplies -- contrib/detectors/gcp v1.44.0 pins semconv 1.41.0 while
+	// the SDK host detector pins 1.43.0. An empty one never conflicts in
+	// resource.Merge, so a probe using it would pass this test trivially.
+	RegisterResourceDetector("detector-probe", detectorFunc(func(context.Context) (*resource.Resource, error) {
+		called = true
+
+		return resource.NewWithAttributes("https://opentelemetry.io/schemas/1.41.0",
+			attribute.String("probe", "yes")), nil
+	}))
+
+	buildResource(context.Background(), &Config{AppName: "app"}, logging.NewMockLogger(logging.INFO))
+
+	if called {
+		t.Error("detector ran for an unrelated exporter")
+	}
+
+	res := buildResource(context.Background(), &Config{AppName: "app", Exporter: "detector-probe"}, logging.NewMockLogger(logging.INFO))
+
+	if !called {
+		t.Fatal("detector did not run for its own exporter")
+	}
+
+	for _, kv := range res.Attributes() {
+		if string(kv.Key) == "probe" {
+			return
+		}
+	}
+
+	t.Error("detector attributes did not reach the resource")
+}
+
+type detectorFunc func(context.Context) (*resource.Resource, error)
+
+func (f detectorFunc) Detect(ctx context.Context) (*resource.Resource, error) { return f(ctx) }
+
+// host.id detection is not free -- on darwin the SDK shells out to ioreg, which
+// measured ~10ms. The default configuration is prometheus-only and has no use
+// for the label, so it must not pay that cost at every application start.
+func TestBuildResource_prometheusOnlySkipsHostIDDetection(t *testing.T) {
+	for _, exporter := range []string{"", "prometheus"} {
+		t.Run("exporter="+exporter, func(t *testing.T) {
+			res := buildResource(context.Background(), &Config{AppName: "app", Exporter: exporter},
+				logging.NewMockLogger(logging.INFO))
+
+			for _, kv := range res.Attributes() {
+				if string(kv.Key) == "host.id" {
+					t.Errorf("host.id was detected for a pull-only exporter; that costs a subprocess on darwin")
+				}
+			}
+
+			// The attributes that matter to every app must still be present.
+			var gotServiceName bool
+
+			for _, kv := range res.Attributes() {
+				if string(kv.Key) == "service.name" {
+					gotServiceName = true
+				}
+			}
+
+			if !gotServiceName {
+				t.Error("service.name missing")
+			}
+		})
+	}
+}
+
+// A vendor detector pinning an older semconv than the SDK's is the normal case,
+// not a fault: resource.Merge drops the schema URL but keeps every attribute. It
+// must not be reported as a failure, or every healthy boot on Google Cloud logs
+// a warning.
+func TestBuildResource_schemaURLConflictIsNotAFailure(t *testing.T) {
+	RegisterResourceDetector("schema-conflict", detectorFunc(func(context.Context) (*resource.Resource, error) {
+		return resource.NewWithAttributes("https://opentelemetry.io/schemas/1.41.0",
+			attribute.String("cloud.region", "us-central1")), nil
+	}))
+
+	// Warnf is WARN level, which the logger routes to normalOut (stdout); only
+	// ERROR and above go to stderr.
+	logs := testutil.StdoutOutputForFunc(func() {
+		res := buildResource(context.Background(), &Config{AppName: "app", Exporter: "schema-conflict"},
+			logging.NewMockLogger(logging.DEBUG))
+
+		// The attributes are what the backend reads; they must all survive.
+		got := map[string]bool{}
+		for _, kv := range res.Attributes() {
+			got[string(kv.Key)] = true
+		}
+
+		for _, want := range []string{"cloud.region", "host.id", "service.name", "framework_version"} {
+			if !got[want] {
+				t.Errorf("%s was dropped by the conflicting-schema merge", want)
+			}
+		}
+	})
+
+	if strings.Contains(logs, "resource detection was incomplete") {
+		t.Errorf("a schema-URL conflict must not be logged as a failure, got: %q", logs)
+	}
+}
+
+var (
+	errShutdownFailed = errors.New("shutdown failed")
+	errDetectorFailed = errors.New("detector failed")
+)
+
+// failingShutdownReader is a working ManualReader whose Shutdown always fails.
+type failingShutdownReader struct {
+	*metricSdk.ManualReader
+}
+
+func (failingShutdownReader) Shutdown(context.Context) error { return errShutdownFailed }
+
+func TestBuild_shutdownPropagatesReaderError(t *testing.T) {
+	Register("shutdown-fail", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return failingShutdownReader{ManualReader: metricSdk.NewManualReader()}, nil
+	})
+
+	t.Cleanup(func() {
+		registryMu.Lock()
+		defer registryMu.Unlock()
+
+		delete(registry, "shutdown-fail")
+	})
+
+	tests := []struct {
+		desc     string
+		exporter string
+		expErr   error
+	}{
+		{desc: "reader shutdown error is returned", exporter: "shutdown-fail", expErr: errShutdownFailed},
+		{desc: "clean shutdown returns nil", exporter: "", expErr: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := Config{AppName: "app", Exporter: tc.exporter}
+
+			shutdown, _ := Build(t.Context(), &cfg, logging.NewMockLogger(logging.INFO))
+
+			require.ErrorIs(t, shutdown(t.Context()), tc.expErr)
+		})
+	}
+}
+
+func TestBuildResource_incompleteDetectionIsLoggedButKeepsAttributes(t *testing.T) {
+	unsetServiceNameEnv(t)
+
+	RegisterResourceDetector("detector-fail", detectorFunc(func(context.Context) (*resource.Resource, error) {
+		return nil, errDetectorFailed
+	}))
+
+	t.Cleanup(func() {
+		registryMu.Lock()
+		defer registryMu.Unlock()
+
+		delete(detectors, "detector-fail")
+	})
+
+	tests := []struct {
+		desc           string
+		exporter       string
+		expLog         string
+		expServiceName string
+	}{
+		{
+			desc:           "failing detector",
+			exporter:       "detector-fail",
+			expLog:         "metrics: resource detection was incomplete",
+			expServiceName: "app",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			var res *resource.Resource
+
+			// Warnf is WARN level, which the mock logger writes to stdout.
+			logs := testutil.StdoutOutputForFunc(func() {
+				res = buildResource(t.Context(), &Config{AppName: "app", Exporter: tc.exporter},
+					logging.NewMockLogger(logging.DEBUG))
+			})
+
+			assert.Contains(t, logs, tc.expLog)
+			assert.Contains(t, logs, errDetectorFailed.Error())
+
+			serviceName, ok := res.Set().Value("service.name")
+			require.True(t, ok)
+			assert.Equal(t, tc.expServiceName, serviceName.AsString())
+		})
+	}
+}
+
+// Test_buildResource pins how service.name is resolved: APP_NAME wins over the
+// environment, the discarded value is logged, and framework_version is not
+// reachable from the environment at all. Reordering the resource.Option slice in
+// buildResource fails it.
+//
+// Keep these rows identical to traces/exporters.Test_buildResource. The two
+// packages build their resources independently, and they must agree -- otherwise
+// a service reports one name to its trace backend and another to its metric
+// backend, breaking the join between them.
+func Test_buildResource(t *testing.T) {
+	unsetServiceNameEnv(t)
+
+	tests := []struct {
+		name      string
+		cfg       Config
+		env       map[string]string
+		wantAttrs map[string]string
+		wantLog   string
+	}{
+		{
+			name:      "OTEL_SERVICE_NAME loses to APP_NAME and is reported",
+			cfg:       Config{AppName: "app"},
+			env:       map[string]string{"OTEL_SERVICE_NAME": "from-env"},
+			wantAttrs: map[string]string{"service.name": "app"},
+			wantLog:   `service.name="from-env" from the environment is ignored`,
+		},
+		{
+			name: "service.name in OTEL_RESOURCE_ATTRIBUTES loses, its siblings do not",
+			cfg:  Config{AppName: "app"},
+			env: map[string]string{
+				"OTEL_RESOURCE_ATTRIBUTES": "service.name=from-env,deployment.environment=prod",
+			},
+			wantAttrs: map[string]string{"service.name": "app", "deployment.environment": "prod"},
+			wantLog:   `service.name="from-env" from the environment is ignored`,
+		},
+		{
+			name:      "no warning when the environment agrees with APP_NAME",
+			cfg:       Config{AppName: "app"},
+			env:       map[string]string{"OTEL_SERVICE_NAME": "app"},
+			wantAttrs: map[string]string{"service.name": "app"},
+		},
+		{
+			name:      "framework_version is not overridable from the environment",
+			cfg:       Config{AppName: "app"},
+			env:       map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "framework_version=hacked"},
+			wantAttrs: map[string]string{"framework_version": version.Framework},
+		},
+		{
+			name:      "malformed OTEL_RESOURCE_ATTRIBUTES keeps its valid entries and is reported",
+			cfg:       Config{AppName: "app"},
+			env:       map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "broken,deployment.environment=prod"},
+			wantAttrs: map[string]string{"deployment.environment": "prod"},
+			wantLog:   "resource detection was incomplete",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			handled := countOtelErrors(t)
+
+			var res *resource.Resource
+
+			// Warnf goes to stdout: the framework logger reserves stderr for ERROR
+			// and above.
+			out := testutil.StdoutOutputForFunc(func() {
+				res = buildResource(t.Context(), &tt.cfg, logging.NewMockLogger(logging.WARN))
+			})
+
+			assertServiceNameWarning(t, out, tt.wantLog)
+			assertResourceAttrs(t, res, tt.wantAttrs)
+
+			// buildResource reports a malformed environment through the logger above;
+			// it must not also hand it to otel.Handle, which the SDK already does on
+			// its own re-reads of the environment.
+			if n := handled.Load(); n != 0 {
+				t.Errorf("buildResource called otel.Handle %d time(s), want 0", n)
+			}
+		})
+	}
+}
+
+// countOtelErrors swaps the global OTel error handler for one that counts calls,
+// restoring the previous handler when the test ends.
+func countOtelErrors(t *testing.T) *atomic.Int32 {
+	t.Helper()
+
+	var n atomic.Int32
+
+	prev := otel.GetErrorHandler()
+
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(error) { n.Add(1) }))
+	t.Cleanup(func() { otel.SetErrorHandler(prev) })
+
+	return &n
+}
+
+func assertServiceNameWarning(t *testing.T, out, wantLog string) {
+	t.Helper()
+
+	if wantLog != "" && !strings.Contains(out, wantLog) {
+		t.Errorf("expected log to mention %q, got: %q", wantLog, out)
+	}
+
+	if wantLog == "" && strings.Contains(out, "from the environment is ignored") {
+		t.Errorf("unexpected service.name warning: %q", out)
+	}
+}
+
+func assertResourceAttrs(t *testing.T, res *resource.Resource, wantAttrs map[string]string) {
+	t.Helper()
+
+	got := map[string]string{}
+	for _, kv := range res.Attributes() {
+		got[string(kv.Key)] = kv.Value.AsString()
+	}
+
+	for k, v := range wantAttrs {
+		if got[k] != v {
+			t.Errorf("resource attribute %q = %q, want %q", k, got[k], v)
+		}
+	}
+
+	if _, ok := got["framework_version"]; !ok {
+		t.Error("expected framework_version on the resource")
+	}
+}
+
+// Build is exported, so an external caller can reach it without a logger.
+// noopLogger is documented as the fallback for that caller; this pins that it
+// is actually substituted rather than dereferenced.
+func Test_Build_substitutesNoopLoggerForANilLogger(t *testing.T) {
+	Register("nil-logger-test", func(_ context.Context, _ *Config, _ Logger) (metricSdk.Reader, error) {
+		return metricSdk.NewManualReader(), nil
+	})
+
+	tests := []struct {
+		name     string
+		exporter string
+		env      map[string]string
+	}{
+		{name: "prometheus only", exporter: ""},
+		{name: "unknown exporter falls back to prometheus", exporter: "no-such-exporter"},
+		{name: "push exporter builds", exporter: "nil-logger-test"},
+		// An ignored service.name is logged, so the nil path must survive a call
+		// that actually reaches the logger rather than only ones that skip it.
+		{
+			name:     "environment sets service.name",
+			exporter: "",
+			env:      map[string]string{"OTEL_SERVICE_NAME": "from-env"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			cfg := Config{AppName: "app", AppVersion: "v1", Exporter: tt.exporter}
+
+			shutdown, meter := Build(t.Context(), &cfg, nil)
+			if shutdown == nil || meter == nil {
+				t.Fatal("Build must never return a nil ShutdownFunc or Meter")
+			}
+
+			_ = shutdown(t.Context())
+		})
+	}
+}

@@ -1,0 +1,1049 @@
+---
+name: Workflow-Pipeline
+permissions:
+  contents: read
+
+# Define when this workflow should run
+on:
+  # Run on push events to main or development branches
+  push:
+    branches:
+      - main
+      - development
+    # Kept on `push` only. A docs merge cannot change Go coverage or lint
+    # results, and re-running the pipeline on development would publish a
+    # duplicate qlty point via upload_coverage and queue behind other merges
+    # (push runs are deliberately never cancelled — see the concurrency note
+    # below). The gating that matters happens on `pull_request`, which
+    # deliberately has no filter so docs-only PRs run the full required set.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  # Run on pull requests to main or development branches
+  pull_request:
+    branches:
+      - main
+      - development
+
+# One in-flight run per ref. Pushing twice to a PR branch otherwise starts a
+# second full 14-job matrix — including the Kafka/Redis/MySQL services and the
+# Zipkin/MinIO containers — while the first is still running, and only the
+# newer result is ever looked at.
+#
+# Cancellation is limited to pull_request on purpose. On `development` the runs
+# are serialized merges rather than rapid re-pushes, so there is little to save,
+# and `upload_coverage` publishes to qlty per push — cancelling that loses the
+# coverage data point for a commit that will not be built again.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# A pipe after the proxy makes the go command fall back to fetching from the
+# source repository on ANY proxy error, including a dropped connection or a
+# timeout. The default comma form falls back only on 404/410, so one bad
+# response from proxy.golang.org failed the whole job.
+env:
+  GOPROXY: https://proxy.golang.org|direct
+
+# Define the jobs that this workflow will run
+jobs:
+  # Job for testing the examples directory
+  Example-Unit-Testing:
+    name: Example Unit Testing (v${{ matrix.go-version }})🛠
+    runs-on: ubuntu-latest
+    # Bounds a hung job at 30m instead of GitHub's 6h default. The retry action
+    # below caps the test step itself (5m x 2 attempts), but `Get dependencies`,
+    # the MinIO readiness poll and the s3 example test are otherwise unbounded.
+    timeout-minutes: 30
+    # Define a matrix strategy to test against multiple Go versions
+    strategy:
+      matrix:
+        go-version: ['1.26','1.25', '1.24']
+      # Continue with other jobs if one version fails
+      fail-fast: false
+
+    # Define service containers that tests depend on
+    services:
+      # Kafka service
+      #
+      # NOTE: the `bitnamilegacy` namespace is a frozen archive — Bitnami state
+      # it receives no further updates and "may be removed in the future". This
+      # image therefore still needs to move (to apache/kafka, or a mirror under
+      # gofr-dev), which is tracked separately in #3868: that migration rewrites
+      # the whole KAFKA_CFG_* block below, since those names are a Bitnami
+      # convention, and it cannot be validated without a live CI run. Kept here
+      # deliberately so this PR stays reviewable.
+      kafka:
+        image: bitnamilegacy/kafka:3.4.1
+        ports:
+          - "9092:9092"
+        env:
+          KAFKA_ENABLE_KRAFT: yes
+          KAFKA_CFG_PROCESS_ROLES: broker,controller
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: true
+          KAFKA_BROKER_ID: 1
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
+          ALLOW_PLAINTEXT_LISTENER: yes
+          KAFKA_CFG_NODE_ID: 1
+        # kafka-topics.sh is on PATH in this image (/opt/bitnami/kafka/bin) and
+        # returns non-zero until the broker accepts connections. The 10s
+        # timeout is deliberate — the check starts a JVM, so the 5s used for
+        # redis/mysql would risk timing out on a broker that is actually fine.
+        options: >-
+          --health-cmd "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"
+          --health-interval=10s
+          --health-timeout=10s
+          --health-retries=10
+
+      # Redis service
+      redis:
+        image: redis:7.0.5
+        ports:
+          - "2002:6379"
+        # Without a health check the runner waits for the container to start,
+        # not for the service inside it to accept connections. The health
+        # options are appended to the existing --entrypoint override.
+        options: >-
+          --entrypoint redis-server
+          --health-cmd "redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # MySQL service
+      mysql:
+        image: mysql:8.2.0
+        ports:
+          - "2001:3306"
+        env:
+          MYSQL_ROOT_PASSWORD: "password"
+          MYSQL_DATABASE: "test"
+        # MySQL is the one that takes meaningfully long to accept connections
+        # after the container starts, so it is the one most likely to have been
+        # racing the tests.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ppassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    # Steps to execute for this job
+    steps:
+      - name: Checkout code into go module directory
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Full git history for accurate testing
+
+      # Set up the Go environment with the specified version
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go-version }}
+        id: Go
+
+      # go.work pins a newer Go than the older matrix versions install, and a
+      # plain GOTOOLCHAIN=auto resolves that to a read-only toolchain module.
+      # See the action for why that breaks coverage builds.
+      - name: Allow Go toolchain auto-upgrade
+        uses: ./.github/actions/setup-go-toolchain
+
+      - name: Get dependencies
+        uses: ./.github/actions/go-mod-download
+
+      # Same treatment as the MinIO step below: pin the image and wait for the
+      # service, not for `docker run -d` to return. `:latest` also meant the
+      # image could change under the repo without any commit.
+      - name: Start Zipkin
+        run: |
+          docker run -d --name zipkin -p 2005:9411 \
+            openzipkin/zipkin:3.6.1@sha256:d17e856dcbba7ffeefbbfc252f89ab78a4ab6faed47e646d46daad78f91b5ee2
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:2005/health >/dev/null; then
+              echo "Zipkin is ready"; exit 0
+            fi
+            echo "waiting for Zipkin... ($i)"; sleep 2
+          done
+          echo "::error::Zipkin failed to become ready after 60s"
+          docker logs zipkin || true
+          exit 1
+
+      # MinIO can't run as a GitHub Actions `services:` container because the
+      # stock image needs a `server /data` command, which services can't set.
+      # Run it explicitly (same pattern as Zipkin above) and wait for readiness.
+      - name: Start MinIO
+        run: |
+          # Pulled from Chainguard. MinIO no longer publishes public images:
+          # docker.io/minio/minio returns "pull access denied" and, since
+          # 2026-09, quay.io/minio/minio returns "unauthorized" for every tag
+          # and digest; bitnami/minio is gone and dl.min.io answers 410.
+          # cgr.dev/chainguard/minio is MinIO built from the upstream AGPL
+          # source (RELEASE.2026-09-22T19-25-18Z at this digest), with the
+          # same `minio` entrypoint, so `server /data` is unchanged.
+          # Pinned by digest because this step is required: an unexpected image
+          # change can't silently alter the integration guard for #3804.
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
+            server /data
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is ready"; exit 0
+            fi
+            echo "waiting for MinIO... ($i)"; sleep 2
+          done
+          # If MinIO never became ready (image-pull failure, registry rate-limit,
+          # crash) fail loudly here. Otherwise the integration test for #3804 would
+          # silently skip and the job would still report success.
+          echo "::error::MinIO failed to become ready after 60s"
+          docker logs minio || true
+          exit 1
+
+      - name: Test
+        id: test
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 5  # Maximum time for the tests to run
+          # No retry. The example tests used to race their own server's boot — every one of them
+          # slept a fixed 100ms after `go main()` and hoped — and a retry turned that into a green
+          # tick. It equally hid a real regression that happened to pass on the second attempt.
+          # They now wait on a readiness signal (testutil.WaitFor*), so a failure here is a
+          # failure. The action is kept for its timeout_minutes.
+          max_attempts: 1
+          command: |
+            # The retry action runs this block with a plain shell (no errexit),
+            # unlike native `run:` steps that default to `bash -eo pipefail`.
+            # Without `set -e` a failing `go test` (below) is swallowed because
+            # the block's exit code is that of its last command (`go tool cover`,
+            # which returns 0), so the job goes green on red tests (#3812).
+            set -eo pipefail
+            export APP_ENV=test
+            # Run tests for the examples directory with coverage
+            go test ./examples/... -v -short -covermode=atomic -coverprofile packageWithpbgo.cov -coverpkg=./examples/...
+             # Filter out auto-generated files by protobuf and gofr framework from coverage report
+            grep -vE '(/client/|grpc-.+-client/main\.go|_client\.go|_gofr\.go|_grpc\.pb\.go|\.pb\.go|\.proto|health_.*\.go)' packageWithpbgo.cov > profile.cov
+            # Display coverage statistics
+            go tool cover -func profile.cov
+
+      # The S3 example is its own submodule (it depends on the s3 datasource
+      # submodule), so it is not covered by `go test ./examples/...` above.
+      # Run it explicitly against the MinIO service — this is the integration
+      # guard for the s3 datasource (gofr-dev/gofr#3804).
+      - name: Test using-s3-filestore example against MinIO
+        working-directory: examples/using-s3-filestore
+        env:
+          S3_ENDPOINT: "http://localhost:9000"
+          # Treat the s3 integration test as required, not optional: if MinIO is
+          # unreachable the test must fail rather than skip, so a broken backend
+          # can never turn the #3804 guard into a silent no-op.
+          S3_REQUIRE_MINIO: "true"
+        run: go test -v ./...
+
+      # Upload coverage report for the 1.24 Go version only
+      - name: Upload Test Coverage
+        if: ${{ matrix.go-version == '1.24'}}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Example-Test-Report
+          path: profile.cov
+
+  # Job for testing the pkg directory
+  PKG-Unit-Testing:
+    name: PKG Unit Testing (v${{ matrix.go-version }})🛠
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        go-version: ['1.26','1.25', '1.24']
+      fail-fast: false
+
+    steps:
+      - name: Checkout code into go module directory
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go-version }}
+        id: Go
+
+      # go.work pins a newer Go than the older matrix versions install, and a
+      # plain GOTOOLCHAIN=auto resolves that to a read-only toolchain module.
+      # See the action for why that breaks coverage builds.
+      - name: Allow Go toolchain auto-upgrade
+        uses: ./.github/actions/setup-go-toolchain
+
+      - name: Get dependencies
+        uses: ./.github/actions/go-mod-download
+
+      # Run pkg tests with automatic retry logic
+      - name: Test with Retry Logic
+        id: test
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 5
+          max_attempts: 2
+          retry_on: error
+          command: |
+            # The retry action runs this block with a plain shell (no errexit),
+            # so a bare `go test` failure would be swallowed by a later 0-exit
+            # command (#3812). `set -e` guards the coverage-combine lines below;
+            # the `|| exit_code=$?` captures keep the explicit panic (exit 2)
+            # detection working instead of aborting on the first test failure.
+            set -eo pipefail
+            export APP_ENV=test
+
+            # Run tests for root gofr package.
+            #
+            # -race here specifically (not the sub-packages run below, which is
+            # slower and heavier on external services) is what makes concurrency
+            # fixes in this package durable: the WebSocket/serveWithGoroutine
+            # data race fixed alongside this line had no CI signal until now
+            # (#3930) — go test -race stayed a claim in a doc comment nobody
+            # could fail on. -race requires cgo, which ubuntu-latest provides by
+            # default.
+            #
+            # `-coverpkg=./pkg/gofr/...`, not `./pkg/gofr`: the narrow form
+            # instruments only the 29 top-level pkg/gofr/*.go files, so every
+            # in-repo sub-package — http, http/middleware, container, service,
+            # logging, cmd, migration, rbac, datasource/sql, datasource/redis
+            # and the rest — was absent from the published figure even though
+            # its tests run here on every push. The narrow glob measured 1,848
+            # statements; the tree measures 10,482, and the figure went from
+            # 86.5% to 90.0% without a new test being written (#4202).
+            exit_code=0
+            go test -v -short -race -covermode=atomic \
+              -coverpkg=./pkg/gofr/... -coverprofile=root_pkg.cov ./pkg/gofr || exit_code=$?
+            if [ $exit_code -eq 2 ]; then
+              echo "::error::Panic detected in root gofr package tests"
+              exit 2
+            elif [ $exit_code -ne 0 ]; then
+              echo "::error::Root gofr package tests failed"
+              exit $exit_code
+            fi
+
+            # Run tests for sub-packages. Same widening as above; the profile
+            # name says sub-packages because these are packages of this module,
+            # not the pkg/gofr/datasource/* submodules (those are separate Go
+            # modules, covered by Submodule-Unit-Testing).
+            exit_code=0
+            go test -v -covermode=atomic \
+              -coverpkg=./pkg/gofr/... -coverprofile=sub_pkgs.cov ./pkg/gofr/... || exit_code=$?
+            if [ $exit_code -eq 2 ]; then
+              echo "::error::Panic detected in gofr sub-packages tests"
+              exit 2
+            elif [ $exit_code -ne 0 ]; then
+              echo "::error::Gofr sub-packages tests failed"
+              exit $exit_code
+            fi
+
+            # Combine coverage profiles.
+            #
+            # `/mock_` strips generated gomock files. `/testutil/` strips the
+            # test helper package, which the widened -coverpkg would otherwise
+            # admit: it is scaffolding for tests, not shipped behaviour, and at
+            # 98% it flatters the numerator the same way the mocks would.
+            #
+            # The awk merges duplicate blocks. Under a multi-package -coverpkg
+            # every block is emitted once per test binary, so a plain
+            # concatenation here is 31 copies of the same 12k blocks: 21 MB of
+            # profile to upload, download and hand to qlty. Keyed by block
+            # position, statement count carried through, execution counts
+            # summed — which is what merging two profiles of the same code
+            # means. `go tool cover` reaches the same percentage either way
+            # (it resolves duplicates itself); this is about the artifact, and
+            # about a profile a human can read.
+            echo "mode: atomic" > profile.cov
+            grep -h -v "mode:" root_pkg.cov sub_pkgs.cov \
+              | grep -v '/mock_' \
+              | grep -v '/testutil/' \
+              | awk '{stmts[$1] = $2; count[$1] += $3} END {for (blk in stmts) print blk, stmts[blk], count[blk]}' \
+              | sort >> profile.cov
+
+            # Show coverage summary
+            go tool cover -func profile.cov
+
+      # Upload coverage report for the 1.24 Go version only
+      - name: Upload Test Coverage
+        if: ${{ matrix.go-version == '1.24'}}
+        uses: actions/upload-artifact@v7
+        with:
+          name: PKG-Coverage-Report
+          path: profile.cov
+
+  # Job for analyzing and reporting code coverage
+  parse_coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Now also needs the submodule job. Without it this job did not merely miss
+    # the submodule artifact — it did not wait for it either, and started before
+    # those uploads had finished.
+    needs: [ Example-Unit-Testing,PKG-Unit-Testing,Submodule-Unit-Testing ]
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v7
+
+      # `go tool cover` below needs a Go toolchain. This job previously ran it
+      # with no setup-go step at all, silently depending on whatever Go the
+      # ubuntu-latest image happened to ship.
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      # Download coverage reports from previous jobs
+      - name: Download Coverage Report
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # Merge the coverage reports from Example, PKG and submodule tests.
+      # The submodule profiles were previously produced and then read by
+      # nothing, so the published figure covered neither pkg/gofr/datasource/*
+      # nor pkg/gofr/metrics/exporters/* while appearing to be a whole-repo
+      # number. The glob is quoted-safe and fails loudly if it matches nothing.
+      - name: Merge Coverage Files
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          submodule_profiles=(./submodule-coverage-reports/*.cov)
+          if [ ${#submodule_profiles[@]} -eq 0 ]; then
+            echo "::error::no submodule coverage profiles found — the merged figure would silently exclude them"
+            exit 1
+          fi
+          echo "Merging ${#submodule_profiles[@]} submodule profile(s) with Example and PKG"
+          echo "mode: atomic" > merged_profile.cov
+          # `| grep -v '/mock_'` matches the PKG job, which strips generated
+          # mocks before it uploads its profile. Without it here the two halves
+          # of one number are computed under different rules: pkg/gofr excludes
+          # its mocks while the submodules count theirs, and gomock mocks are
+          # heavily exercised by the tests that use them, so the merged figure
+          # is flattered by generated code. 66 mock_*.go files live under the
+          # submodules.
+          grep -h -v "mode:" \
+            ./Example-Test-Report/profile.cov \
+            ./PKG-Coverage-Report/profile.cov \
+            "${submodule_profiles[@]}" | grep -v '/mock_' >> merged_profile.cov
+
+      # Calculate and output the total code coverage percentage.
+      # This is written to the job summary rather than only echoed into a log —
+      # previously the value went to $GITHUB_ENV and was read by nobody, since
+      # its only consumer (a 92% threshold gate) was commented out.
+      - name: Parse code-coverage value
+        working-directory: artifacts
+        run: |
+          codeCoverage=$(go tool cover -func=merged_profile.cov | grep total | awk '{print $3}')
+          codeCoverage=${codeCoverage%?}
+          echo "CODE_COVERAGE=$codeCoverage" >> $GITHUB_ENV
+          echo "✅ Total Code Coverage: $codeCoverage%"
+          {
+            echo "### Code coverage"
+            echo ""
+            echo "**${codeCoverage}%** across examples, pkg/gofr and the submodules."
+            echo ""
+            echo "Includes the datasource and metrics-exporter submodules, which"
+            echo "were excluded from this figure before #3866."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # NOTE: a coverage threshold gate belongs here, and used to exist as a
+  # commented-out 92% check. Whether to restore it and at what floor is
+  # tracked in #4155 — it cannot be decided until a run has published the
+  # post-merge figure.
+
+  # Job for testing submodules inside the pkg directory
+  Submodule-Unit-Testing:
+    name: Submodule Unit Testing (v${{ matrix.go-version }})🛠
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        go-version:  ['1.26','1.25', '1.24']
+      fail-fast: false
+
+    steps:
+      - name: Checkout code into go module directory
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go-version }}
+        id: Go
+
+      # go.work pins a newer Go than the older matrix versions install, and a
+      # plain GOTOOLCHAIN=auto resolves that to a read-only toolchain module.
+      # See the action for why that breaks coverage builds.
+      - name: Allow Go toolchain auto-upgrade
+        uses: ./.github/actions/setup-go-toolchain
+
+      # Find all submodules (directories with go.mod files) in the pkg directory
+      - name: Detect Submodules
+        id: detect_submodules
+        run: |
+          # Find all directories containing a go.mod file within 'pkg'
+          SUBMODULES=$(find pkg -name "go.mod" -exec dirname {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "submodules=$SUBMODULES" >> $GITHUB_OUTPUT
+
+      # Test all submodules in parallel with retry logic
+      - name: Test Submodules with Retry and Parallelism
+        id: test_submodules
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 5
+          max_attempts: 2
+          command: |
+            # The retry action runs this block with a plain shell (no errexit),
+            # unlike native `run:` steps that default to `bash -eo pipefail` (#3812).
+            set -eo pipefail
+            export APP_ENV=test
+
+            # Create a directory for coverage reports. Resolve it to an absolute path:
+            # each worker below cds into its own module, which sits at a different depth
+            # (pkg/gofr/datasource/mongo vs pkg/gofr/datasource/file/s3), so no single
+            # relative path reaches this directory from all of them (#3824).
+            mkdir -p coverage_reports
+            export COVERAGE_DIR="$PWD/coverage_reports"
+
+            # Get the list of submodules
+            SUBMODULES='${{ steps.detect_submodules.outputs.submodules }}'
+
+            # Process each submodule in parallel with a maximum of 4 parallel jobs.
+            # `jq -r` and the positional argument matter: xargs substitutes {} into the
+            # script *text* before bash parses it, so an interpolated module path would be
+            # re-parsed as shell source rather than passed as data.
+            echo "$SUBMODULES" | jq -r '.[]' | xargs -I{} -P 4 bash -c '
+              # Without errexit the worker runs to completion regardless, and its exit
+              # status is that of its last command — so a failing `go test` was invisible
+              # and the job reported green on red tests (#3824).
+              set -eo pipefail
+
+              module="$1"
+              echo "Testing module: $module"
+              cd "$module"
+
+              # Extract module name (replace / with _)
+              module_name=$(echo "$module" | tr "/" "_")
+
+              # Download dependencies for the submodule. Deliberately no
+              # `go mod tidy` here: tidy rewrites go.mod/go.sum in place, so the
+              # tests would run against whatever tidy resolved at that moment
+              # rather than against what the repo actually declares. A submodule
+              # with an incomplete committed go.mod would be silently repaired
+              # in the runner and pass, then fail for anyone who clones it —
+              # CI quietly fixing the exact defect it exists to report. Tidiness
+              # is checked without mutation in the code_quality job instead.
+              go mod download
+
+              # NOTE: this whole block is the single-quoted payload of the
+              # `bash -c` above, so nothing in here may contain an apostrophe —
+              # not even inside a comment. One in a comment closes the quote and
+              # the runner fails with a syntax error before any test runs.
+              #
+              # Deliberately NOT `-short`. It does not merely shorten these
+              # suites, it deletes whole test functions from the coverage figure:
+              # the mtest harness shipped by the mongo driver calls t.Skip with
+              # "skipping mtest integration test in short mode" even under
+              # ClientType of mtest.Mock, which needs no server and no network.
+              # Ten test functions covering every mongo CRUD path were being
+              # skipped, so pkg/gofr/datasource/mongo reported 27.2% instead of
+              # 87.7% for tests that already exist and run in 1.4s.
+              #
+              # Measured across all 27 submodules: mongo is the only one whose
+              # figure changes at all and the only one with any testing.Short
+              # gating, and all 27 pass either way. Dropping the flag changes
+              # only what mtest was hiding.
+              #
+              # -covermode=atomic matches the Example and PKG jobs. These
+              # profiles are now merged with those into one report, and the
+              # merged file declares "mode: atomic"; without this flag the
+              # submodule profiles were written in the default "set" mode, so
+              # the merge combined 0/1 flags with hit counts under an atomic
+              # header.
+              go test ./... -v -covermode=atomic -coverprofile="${module_name}.cov" -coverpkg=./...
+
+              # Copy coverage file to the coverage_reports directory
+              cp "${module_name}.cov" "$COVERAGE_DIR/"
+            ' _ {}
+
+      # Upload submodule coverage reports as an artifact.
+      # Gated on a single matrix leg, like the Example and PKG uploads. Without
+      # this all three legs uploaded under the same artifact name — v7 permits
+      # duplicate names where v4 would have rejected them, so it produced three
+      # identical artifacts and no error. Uses the same '1.24' gate as the other
+      # two jobs so #3859 can move all three together rather than twice.
+      - name: Upload Coverage Reports
+        if: ${{ matrix.go-version == '1.24'}}
+        uses: actions/upload-artifact@v7
+        with:
+          name: submodule-coverage-reports
+          path: coverage_reports/*.cov
+          # upload-artifact defaults to `warn`, which is how an empty coverage_reports/
+          # stayed green for months while the cp above never landed a file (#3824).
+          if-no-files-found: error
+
+  # Job for uploading coverage to external services (qlty.sh)
+  upload_coverage:
+    name: Upload Coverage📊
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      QLTY_TOKEN: ${{ secrets.QLTY_TOKEN }}
+      QLTY_COVERAGE_TOKEN: ${{ secrets.QLTY_TOKEN }}
+
+    # Needs the submodule results too — what qlty publishes should be the same
+    # figure parse_coverage reports, and both were missing the submodules.
+    needs: [Example-Unit-Testing, PKG-Unit-Testing, Submodule-Unit-Testing]
+    # Only run this job on pushes to the development branch
+    if: ${{ github.repository == 'gofr-dev/gofr' && github.event_name == 'push' && github.ref == 'refs/heads/development'}}
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v7
+
+      # Same reason as parse_coverage: the merge step below runs `go tool cover`
+      # and had no Go toolchain of its own.
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Install qlty CLI
+        run: |
+          curl https://qlty.sh | sh
+          echo "$HOME/.qlty/bin" >> $GITHUB_PATH
+
+      # Download coverage artifacts
+      - name: Download Coverage Report
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # Merge coverage from example, pkg and submodule tests. Kept identical to
+      # the merge in parse_coverage so the number published to qlty and the
+      # number reported on the PR cannot drift apart.
+      - name: Merge Coverage Files
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          submodule_profiles=(./submodule-coverage-reports/*.cov)
+          if [ ${#submodule_profiles[@]} -eq 0 ]; then
+            echo "::error::no submodule coverage profiles found — refusing to publish a figure that silently excludes them"
+            exit 1
+          fi
+          echo "Merging ${#submodule_profiles[@]} submodule profile(s) with Example and PKG"
+          echo "mode: atomic" > merged_profile.cov
+          # `| grep -v '/mock_'` matches the PKG job, which strips generated
+          # mocks before it uploads its profile. Without it here the two halves
+          # of one number are computed under different rules: pkg/gofr excludes
+          # its mocks while the submodules count theirs, and gomock mocks are
+          # heavily exercised by the tests that use them, so the merged figure
+          # is flattered by generated code. 66 mock_*.go files live under the
+          # submodules.
+          grep -h -v "mode:" \
+            ./Example-Test-Report/profile.cov \
+            ./PKG-Coverage-Report/profile.cov \
+            "${submodule_profiles[@]}" | grep -v '/mock_' >> merged_profile.cov
+
+          # Generate and print total coverage percentage
+          echo "Total Coverage:"
+          go tool cover -func=merged_profile.cov | tail -n 1
+        shell: bash
+
+      # Upload merged coverage to CodeClimate for analysis
+      - name: Upload
+        working-directory: artifacts
+        run: qlty coverage publish merged_profile.cov --format=coverprofile --strip-prefix="gofr.dev/" --add-prefix="${GITHUB_WORKSPACE}/"
+        env:
+          QLTY_TOKEN: ${{ secrets.QLTY_TOKEN }}
+
+  # Job for code quality checks
+
+  slim_build_tags:
+    name: Slim Build Tags🪶
+    runs-on: ubuntu-latest
+    # Only builds and runs the packages the tags touch, so it stays well inside
+    # the time the rest of the matrix takes.
+    timeout-minutes: 15
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v7
+        with:
+          # The package-list check below diffs against the merge base, so it
+          # needs the history to find one.
+          fetch-depth: 0
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+
+      # Half of the code the build tags add is compiled only when the tags are
+      # set, so without this job nothing ever builds it. A later edit to
+      # container.go that referenced kafka. or google. directly would compile and
+      # pass every other job while silently breaking the tagged build.
+      - name: Build and test with optional subsystems omitted
+        run: |
+          set -euo pipefail
+          for tags in "gofr_nosqldrivers" "gofr_nopubsub" "gofr_nographql" "gofr_nosqldrivers gofr_nopubsub gofr_nographql"; do
+            echo "::group::-tags '$tags'"
+            go build -tags "$tags" ./...
+            go vet   -tags "$tags" ./pkg/gofr/ ./pkg/gofr/container/ ./pkg/gofr/datasource/sql/
+            go test  -tags "$tags" -count=1 ./pkg/gofr/container/ ./pkg/gofr/datasource/sql/
+            echo "::endgroup::"
+          done
+
+          # The GraphQL stubs have their own tests, which only exist under the tag.
+          go test -tags gofr_nographql -count=1 -run TestGraphQLDisabled ./pkg/gofr/
+
+      # Unlike the other tags gofr_nogrpc removes exported methods -- RegisterService
+      # and the AddGRPC* setters name grpc types and cannot exist without the
+      # import -- so the gRPC server examples are built only without it: their
+      # gofr-dependent files carry //go:build !gofr_nogrpc. Several are generated
+      # by gofr-cli, which drops the tag on regeneration; building ./... here is
+      # what catches that.
+      - name: Build and test with the gRPC server omitted
+        run: |
+          set -euo pipefail
+          go build -tags gofr_nogrpc ./...
+          go vet   -tags gofr_nogrpc ./pkg/gofr/
+          go test  -tags gofr_nogrpc -count=1 -run TestGRPCDisabled ./pkg/gofr/
+
+      # gofr_nodgraph drops the Dgraph migrator, the one place in GoFr that imports
+      # dgo. The stub has to keep implementing migrator, so a change to that
+      # interface must update both halves; without this step only the real one
+      # would ever be compiled.
+      - name: Build and test with the Dgraph migrator omitted
+        run: |
+          set -euo pipefail
+          go build -tags gofr_nodgraph ./...
+          go vet   -tags gofr_nodgraph ./pkg/gofr/migration/
+          go test  -tags gofr_nodgraph -count=1 ./pkg/gofr/migration/
+
+      # gofr_nootlp drops the OTLP exporters, which pin google.golang.org/grpc --
+      # otlpmetrichttp included -- so gofr_nogrpc pays off only once this is set
+      # too. It is not sufficient on its own: measured against gofr.dev/pkg/gofr,
+      # which links 86 grpc packages by default, gofr_nogrpc alone leaves 82,
+      # adding gofr_nootlp and gofr_nodgraph leaves 81, and only adding
+      # gofr_nopubsub reaches 0, because the Google Pub/Sub client pins grpc
+      # through cloud.google.com/go. A shared dependency goes when its last
+      # importer does. Both halves of the trace and metric transports have tests
+      # that exist only under the tag.
+      - name: Build and test with the OTLP exporters omitted
+        run: |
+          set -euo pipefail
+          go build -tags gofr_nootlp ./...
+          go vet   -tags gofr_nootlp ./pkg/gofr/ ./pkg/gofr/metrics/exporters/ ./pkg/gofr/traces/exporters/
+          go test  -tags gofr_nootlp -count=1 ./pkg/gofr/metrics/exporters/ ./pkg/gofr/traces/exporters/
+
+      # Every tag above is built on its own, and #4167's three together. A symbol
+      # that resolves under one tag but breaks under two would still ship green, so
+      # all six are also built, vetted and tested at once.
+      - name: Build with every optional subsystem omitted at once
+        run: |
+          set -euo pipefail
+          ALL="gofr_nosqldrivers gofr_nopubsub gofr_nographql gofr_nogrpc gofr_nodgraph gofr_nootlp"
+          PKGS="./pkg/gofr/container/ ./pkg/gofr/datasource/sql/ ./pkg/gofr/migration/ ./pkg/gofr/metrics/exporters/ ./pkg/gofr/traces/exporters/"
+          go build -tags "$ALL" ./...
+          go vet   -tags "$ALL" ./pkg/gofr/ $PKGS
+          go test  -tags "$ALL" -count=1 $PKGS
+          go test  -tags "$ALL" -count=1 -run 'TestGRPCDisabled|TestGraphQLDisabled' ./pkg/gofr/
+
+      # Lint under the tags too. The tagged files are half of what these tags add
+      # and the default lint job never sees them -- moving noopResponder and
+      # configTrue in this PR was prompted by a tagged-build lint failure that
+      # nothing in CI would have caught.
+      - name: Lint with optional subsystems omitted
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+          # Same scoping as the code_quality job: this reports issues THIS branch
+          # introduces, not the ones the repo already carries. Without it the step
+          # reports every pre-existing goconst and exhaustive finding in the tree.
+          only-new-issues: true
+          # ./pkg/... for the same reason as the gofr_nogrpc build step: the gRPC
+          # examples call RegisterService, which that tag removes, so they fail
+          # typecheck under it. only-new-issues does not filter typecheck errors.
+          args: --build-tags "gofr_nosqldrivers,gofr_nopubsub,gofr_nographql,gofr_nogrpc,gofr_nodgraph,gofr_nootlp" --timeout 9m0s ./pkg/...
+
+      # Building and testing under a tag proves the tagged code still compiles. It
+      # does not prove the tag REMOVED anything, which is the only reason the tag
+      # exists. Dropping the `//go:build !gofr_nosqldrivers` constraint from
+      # drivers.go, or adding an import elsewhere that pulls lib/pq back in by
+      # another path, leaves every other step in this job green while the tag
+      # silently does nothing.
+      #
+      # This is also the assertion the sql package cannot make from a test. Its
+      # suite blank-imports pq and modernc.org/sqlite as fixtures
+      # (drivers_testdeps_test.go) because TestNewSQL_GetDBDialect opens a
+      # postgres DSN, so the test binary has those drivers registered in both
+      # configurations. What the *library* links is only observable from outside
+      # the test binary, and this step is where that is observed.
+      #
+      # `go list -deps` is given the PACKAGE PATH, never `./...`: with a pattern,
+      # every matched package is listed whether or not anything links it, so
+      # `./...` reports a tagged-out package as still present.
+      - name: Each tag removes the packages it claims to
+        run: |
+          set -euo pipefail
+
+          # Written to files rather than piped: `grep -q` exits on its first match,
+          # which SIGPIPEs `go list` and trips `pipefail` depending on where in the
+          # list the match happens to fall.
+          go list -deps gofr.dev/pkg/gofr > /tmp/deps.default
+
+          check() {
+            tag=$1
+            pattern=$2
+
+            # Also fails when the packages are absent from the DEFAULT build, so a
+            # renamed or dropped module cannot make this check pass vacuously.
+            if ! grep -Eq "$pattern" /tmp/deps.default; then
+              echo "::error::the default build does not link $pattern, so '-tags $tag' cannot be shown to remove it"
+              exit 1
+            fi
+
+            go list -tags "$tag" -deps gofr.dev/pkg/gofr > "/tmp/deps.$tag"
+
+            if grep -E "$pattern" "/tmp/deps.$tag"; then
+              echo "::error::-tags $tag still links the packages listed above; the tag is not removing what it claims to"
+              exit 1
+            fi
+
+            echo "-tags $tag: $(wc -l < /tmp/deps.default) packages -> $(wc -l < "/tmp/deps.$tag")"
+          }
+
+          check gofr_nosqldrivers '^(github\.com/lib/pq|modernc\.org/sqlite)($|/)'
+          check gofr_nopubsub     '^(github\.com/segmentio/kafka-go|cloud\.google\.com/go/pubsub|github\.com/eclipse/paho\.mqtt\.golang)($|/)'
+          check gofr_nographql    '^github\.com/graphql-go/graphql($|/)'
+          check gofr_nootlp       '^go\.opentelemetry\.io/otel/exporters/otlp($|/)'
+          check gofr_nodgraph     '^github\.com/dgraph-io/dgo($|/)'
+
+          # gofr_nogrpc is checked against the COMBINED tag set, not on its own. grpc is pinned by
+          # the OTLP exporters, the Dgraph protos and cloud.google.com/go as well as by the server,
+          # so on its own it takes 4 of 86 packages and a "still linked" assertion would fail for
+          # reasons that have nothing to do with the tag working.
+          check gofr_nogrpc,gofr_nootlp,gofr_nodgraph,gofr_nopubsub '^google\.golang\.org/grpc($|/)'
+
+          go list -tags gofr_nosqldrivers,gofr_nopubsub,gofr_nographql -deps gofr.dev/pkg/gofr > /tmp/deps.slim
+
+          full=$(wc -l < /tmp/deps.default)
+          slim=$(wc -l < /tmp/deps.slim)
+
+          echo "gofr.dev/pkg/gofr links $full packages by default and $slim with all three tags"
+
+          if [ "$slim" -ge "$full" ]; then
+            echo "::error::all three tags together removed no packages"
+            exit 1
+          fi
+
+      # There is deliberately NO step here diffing the default build's whole package
+      # list against the merge base.
+      #
+      # An earlier revision had one, and it was the wrong gate: this job runs on every
+      # pull request, so a whole-module `go list -deps ./...` diff means "no PR may add
+      # a package or a dependency, ever". That is not a rule this repo has, and the
+      # step would have gone red on changes that have nothing to do with build tags.
+      #
+      # What it was trying to protect is already covered, and covered better, by the
+      # step above: its `grep -Eq "$pattern" /tmp/deps.default` guard fails when a
+      # tagged-out package is missing from the DEFAULT build, so the tags cannot start
+      # passing vacuously and an untagged build cannot quietly stop linking them.
+      # Please do not re-add the broad diff.
+      - name: The tagged packages still build and test untagged
+        run: |
+          set -euo pipefail
+
+          go test -count=1 ./pkg/gofr/container/ ./pkg/gofr/datasource/sql/
+  code_quality:
+    name: Code Quality🎖️
+    runs-on: ubuntu-latest
+    # golangci-lint gets --timeout=5m below; this bounds checkout, module
+    # download and the changed-files scan around it.
+    timeout-minutes: 20
+    outputs:
+      modules: ${{ steps.changed-submodules.outputs.modules }}
+      has_modules: ${{ steps.changed-submodules.outputs.has_modules }}
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Full history needed for proper diff analysis
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Get dependencies
+        uses: ./.github/actions/go-mod-download
+
+      # Replaces the signal the `go mod tidy` in Submodule-Unit-Testing was
+      # accidentally providing. `-diff` (Go 1.23+) reports what tidy would
+      # change and exits non-zero, without writing anything — so an untidy
+      # go.mod is now reported instead of silently repaired mid-test-run.
+      #
+      # Scoped to the pkg/ modules, which are the ones that ship. All of them
+      # are tidy as of this change; the examples are excluded because
+      # examples/using-gcp-metrics is currently untidy and settling that is a
+      # dependency bump, not a CI fix.
+      - name: Check submodule go.mod tidiness
+        run: |
+          rc=0
+          while read -r mod; do
+            dir=$(dirname "$mod")
+            if ! out=$(cd "$dir" && go mod tidy -diff 2>&1); then
+              echo "::error file=$mod::$dir has an untidy go.mod/go.sum — run 'go mod tidy' there"
+              echo "$out"
+              rc=1
+            fi
+          done < <(find pkg -name go.mod)
+          if [ "$rc" -eq 0 ]; then echo "✅ all pkg/ submodules are tidy"; fi
+          exit $rc
+
+      # Use the official golangci-lint action for the root module
+      # This action automatically detects changed files and only reports new issues
+      - name: Lint Root Module
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+          only-new-issues: true
+          args: --timeout=5m
+
+      # Detect changed files to determine which submodules need linting
+      # This implements a changed-files based approach as suggested by the maintainer
+      - name: Get Changed Files
+        id: changed-files
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          files: |
+            pkg/**/*.go
+            pkg/**/go.mod
+            pkg/**/go.sum
+
+      # Find all submodules that have changes
+      - name: Find Changed Submodules
+        id: changed-submodules
+        run: |
+          # Check if any files changed
+          if [ "${{ steps.changed-files.outputs.any_changed }}" != "true" ]; then
+            echo "✅ No changes in pkg/ directory"
+            echo "modules=[]" >> $GITHUB_OUTPUT
+            echo "has_modules=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          changed_files="${{ steps.changed-files.outputs.all_changed_files }}"
+          changed_modules=""
+          
+          echo "📝 Changed files detected:"
+          echo "$changed_files" | tr ' ' '\n'
+          echo ""
+          
+          # Extract unique submodule directories from changed files
+          for file in $changed_files; do
+            # Find the nearest parent directory containing go.mod
+            dir=$(dirname "$file")
+            while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+              if [ -f "$dir/go.mod" ] && [[ "$dir" == pkg/* ]]; then
+                # Check if this module is not already in the list
+                if [[ ! "$changed_modules" =~ (^|[[:space:]])"$dir"($|[[:space:]]) ]]; then
+                  changed_modules="$changed_modules$dir "
+                fi
+                break
+              fi
+              dir=$(dirname "$dir")
+            done
+          done
+          
+          changed_modules=$(echo "$changed_modules" | xargs -n1 | sort -u)
+          
+          if [ -n "$changed_modules" ]; then
+            echo "📦 Submodules with changes:"
+            echo "$changed_modules"
+            # Convert to JSON array for matrix usage
+            modules_json=$(echo "$changed_modules" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "modules=$modules_json" >> $GITHUB_OUTPUT
+            echo "has_modules=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No submodule changes detected"
+            echo "modules=[]" >> $GITHUB_OUTPUT
+            echo "has_modules=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Separate job to lint changed submodules using matrix strategy
+  # This allows us to use the official golangci-lint action for each submodule
+  lint_changed_submodules:
+    name: Lint Submodules🔍
+    runs-on: ubuntu-latest
+    # Must exceed the --timeout=9m passed to golangci-lint below, so a genuine
+    # lint timeout still reports as a lint failure rather than a killed job.
+    timeout-minutes: 20
+    needs: code_quality
+    if: needs.code_quality.outputs.has_modules == 'true'
+    strategy:
+      matrix:
+        module: ${{ fromJson(needs.code_quality.outputs.modules) }}
+      fail-fast: false
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Download dependencies for ${{ matrix.module }}
+        uses: ./.github/actions/go-mod-download
+        with:
+          working-directory: ${{ matrix.module }}
+
+      # Use the official golangci-lint action for this submodule
+      - name: Lint ${{ matrix.module }}
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: ${{ matrix.module }}
+          only-new-issues: true
+          args: --timeout=9m
+
+  # Job for checking filename conventions
+  linting_party:
+    name: Linting Party🥳
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26
+
+      # Check file naming conventions using ls-lint
+      - name: Check for file names errors
+        # Pinned to main: v2.3.1 still declares the deprecated node20 runtime.
+        # 0c7f19c ("chore: run on the node24 runtime") is not in a tagged release yet.
+        uses: ls-lint/action@a87c5eb4fb26d7af1bd0adba203dd1e76f7e94eb # main, node24 runtime
+        with:
+          config: .ls-lint.yml
+
+      # Block compiled executables (extensionless Go binaries, ELF/Mach-O/PE)
+      # from being committed anywhere in the repo — content- and mode-based, so
+      # it can't be defeated by a path or extension. See the script for details.
+      - name: No committed executables
+        run: bash .github/scripts/check-binaries.sh

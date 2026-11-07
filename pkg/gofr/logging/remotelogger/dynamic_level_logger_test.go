@@ -1,0 +1,699 @@
+package remotelogger
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/service"
+	"gofr.dev/pkg/gofr/testutil"
+)
+
+func TestMain(m *testing.M) {
+	os.Setenv("GOFR_TELEMETRY", "false")
+	m.Run()
+}
+
+func TestRemoteLogger_UpdateLevel(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{ "data": { "serviceName": "test-service","logLevel":"DEBUG" } }`
+		_, _ = w.Write([]byte(body))
+	}))
+
+	rl := remoteLogger{
+		remoteURL:          mockServer.URL,
+		levelFetchInterval: 100 * time.Millisecond,
+		currentLevel:       2,
+		Logger:             logging.NewMockLogger(logging.INFO),
+	}
+
+	go rl.UpdateLogLevel()
+
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Equal(t, logging.DEBUG, rl.currentLevel)
+}
+
+func TestRemoteLogger_UpdateLevelError(t *testing.T) {
+	rl := remoteLogger{
+		remoteURL:          "invalid url",
+		levelFetchInterval: 1,
+		currentLevel:       2,
+		Logger:             logging.NewMockLogger(logging.INFO),
+	}
+
+	go rl.UpdateLogLevel()
+
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Equal(t, logging.INFO, rl.currentLevel)
+}
+
+func Test_fetchAndUpdateLogLevel_InvalidResponse(t *testing.T) {
+	logger := logging.NewMockLogger(logging.INFO)
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{ "data": { "serviceName": "test-service","logLevel":"TEST" } }`
+
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(mockServer.Close)
+
+	remoteService := service.NewHTTPService(mockServer.URL, logger, nil)
+
+	level, err := fetchAndUpdateLogLevel(remoteService, logging.DEBUG)
+
+	assert.Equal(t, logging.DEBUG, level, "Test_fetchAndUpdateLogLevel_InvalidResponse, Failed.\n")
+
+	require.NoError(t, err)
+}
+
+func Test_fetchAndUpdateLogLevel_InvalidLogLevel(t *testing.T) {
+	logger := logging.NewMockLogger(logging.INFO)
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{
+			"data": [
+				{
+					"invalid"
+					}
+				}
+			]
+		}`
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(mockServer.Close)
+
+	remoteService2 := service.NewHTTPService(mockServer.URL, logger, nil)
+
+	level, err := fetchAndUpdateLogLevel(remoteService2, logging.DEBUG)
+
+	assert.Equal(t, logging.DEBUG, level, "Test_fetchAndUpdateLogLevel_InvalidResponse, Failed.\n")
+
+	require.Error(t, err)
+}
+
+func TestDynamicLoggerSuccess(t *testing.T) {
+	// Create a mock server that returns a predefined log level
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{ "data": { "serviceName": "test-service","logLevel":"DEBUG" } }`
+
+		_, _ = w.Write([]byte(body))
+	}))
+
+	t.Cleanup(mockServer.Close)
+
+	log := testutil.StdoutOutputForFunc(func() {
+		// Create a new remote logger with the mock server URL
+		rl := New(logging.INFO, mockServer.URL, 100*time.Millisecond)
+
+		// Wait for the remote logger to update the log level
+		time.Sleep(200 * time.Millisecond)
+
+		// Check if the log level has been updated
+		rl.Debug("Debug log after log level change")
+	})
+
+	if !strings.Contains(log, "LOG_LEVEL updated from INFO to DEBUG") {
+		t.Errorf("TestDynamicLoggerSuccess failed! Missing log message about level update")
+	}
+
+	if !strings.Contains(log, "Debug log after log level change") {
+		t.Errorf("TestDynamicLoggerSuccess failed! missing debug log")
+	}
+}
+
+// TestHTTPLogFilter_NonHTTPLogs tests regular non-HTTP logs are passed through.
+func TestHTTPLogFilter_NonHTTPLogs(t *testing.T) {
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+
+	filter := &httpLogFilter{
+		Logger: testLogger,
+	}
+
+	filter.Log("This is a regular message")
+
+	assert.Contains(t, buf.String(), "This is a regular message")
+}
+
+// TestHTTPLogFilter_EmptyArgs tests handling of empty arguments.
+func TestHTTPLogFilter_EmptyArgs(t *testing.T) {
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+
+	filter := &httpLogFilter{
+		Logger: testLogger,
+	}
+
+	filter.Log()
+
+	// Should not write anything meaningful
+	assert.Equal(t, "\n", buf.String())
+}
+
+// TestHTTPLogFilter_InitAndFirstSuccess tests initialization and first successful hit.
+func TestHTTPLogFilter_InitAndFirstSuccess(t *testing.T) {
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+
+	filter := &httpLogFilter{
+		Logger: testLogger,
+	}
+
+	successLog := &service.Log{
+		URI:           "http://example.com/test",
+		ResponseCode:  200,
+		ResponseTime:  150,
+		HTTPMethod:    "GET",
+		CorrelationID: "test-id-1",
+	}
+
+	filter.Log(successLog)
+
+	output := buf.String()
+	assert.Contains(t, output, "Initializing remote logger connection to http://example.com/test")
+	assert.Contains(t, output, "test-id-1")
+}
+
+// TestHTTPLogFilter_SubsequentSuccess tests subsequent successful HTTP hits.
+func TestHTTPLogFilter_SubsequentSuccess(t *testing.T) {
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+
+	filter := &httpLogFilter{
+		Logger:             testLogger,
+		firstSuccessfulHit: true,
+		initLogged:         true,
+	}
+
+	successLog := &service.Log{
+		URI:           "http://example.com/test2",
+		ResponseCode:  200,
+		ResponseTime:  200,
+		HTTPMethod:    "POST",
+		CorrelationID: "test-id-2",
+	}
+
+	filter.Log(successLog)
+
+	output := buf.String()
+	assert.Contains(t, output, "test-id-2")
+	assert.Contains(t, output, "POST")
+	assert.Contains(t, output, "http://example.com/test2")
+}
+
+// TestHTTPLogFilter_ErrorLogs tests handling of error HTTP logs.
+func TestHTTPLogFilter_ErrorLogs(t *testing.T) {
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+
+	filter := &httpLogFilter{
+		Logger:             testLogger,
+		firstSuccessfulHit: true,
+		initLogged:         true,
+	}
+
+	errorLog := &service.Log{
+		URI:           "http://example.com/error",
+		ResponseCode:  500,
+		ResponseTime:  300,
+		HTTPMethod:    "GET",
+		CorrelationID: "test-id-3",
+	}
+
+	filter.Log(errorLog)
+
+	output := buf.String()
+	assert.Contains(t, output, "http://example.com/error")
+	assert.Contains(t, output, "500")
+}
+
+func TestHTTPLogFilter_ConcurrentAccess(t *testing.T) {
+	const (
+		goroutines       = 50
+		logsPerGoroutine = 20
+	)
+
+	var buf strings.Builder
+
+	testLogger := &testBufferLogger{buf: &buf}
+	filter := &httpLogFilter{Logger: testLogger}
+
+	var wg sync.WaitGroup
+
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+
+			for j := 0; j < logsPerGoroutine; j++ {
+				filter.Log(&service.Log{
+					CorrelationID: fmt.Sprintf("req-%d-%d", id, j),
+					URI:           "/test",
+					HTTPMethod:    "GET",
+					ResponseCode:  200,
+					ResponseTime:  int64(j),
+				})
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	filter.mu.Lock()
+	assert.True(t, filter.initLogged, "expected initLogged to be true")
+	filter.mu.Unlock()
+
+	assert.NotEmpty(t, buf.String(), "expected logs to be written")
+}
+
+func TestRemoteLogger_ConcurrentLevelAccess(t *testing.T) {
+	var count int32
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		lvl := "DEBUG"
+
+		if atomic.AddInt32(&count, 1)%2 == 0 {
+			lvl = "ERROR"
+		}
+
+		fmt.Fprintf(w, `{"data":{"serviceName":"test-service","logLevel":"%s"}}`, lvl)
+	}))
+
+	t.Cleanup(mockServer.Close)
+
+	rl := &remoteLogger{
+		remoteURL:          mockServer.URL,
+		levelFetchInterval: 5 * time.Millisecond,
+		currentLevel:       logging.INFO,
+		Logger:             logging.NewMockLogger(logging.INFO),
+	}
+
+	// Run UpdateLogLevel in multiple goroutines
+	for i := 0; i < 5; i++ {
+		go rl.UpdateLogLevel()
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+
+	assert.NotEqual(t, logging.INFO, rl.currentLevel, "expected level to change")
+}
+
+func TestLogLevelChangeToFatal_NoExit(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{ "data": { "serviceName": "test-service", "logLevel": "FATAL" } }`
+
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(mockServer.Close)
+
+	// This test succeeds if it completes without the process exiting. A change
+	// into FATAL is announced at ERROR (via Errorf) — the most severe level
+	// still guaranteed to be visible — so the announcement goes to stderr.
+	var stdout string
+
+	stderr := testutil.StderrOutputForFunc(func() {
+		stdout = testutil.StdoutOutputForFunc(func() {
+			rl := New(logging.INFO, mockServer.URL, 10*time.Millisecond)
+
+			time.Sleep(20 * time.Millisecond)
+
+			// If we reach this point, the application didn't exit
+			// Now check that the logger did change to FATAL level
+			if remoteLogger, ok := rl.(*remoteLogger); ok {
+				remoteLogger.mu.RLock()
+
+				assert.Equal(t, logging.FATAL, remoteLogger.currentLevel, "Log level should be updated to FATAL")
+
+				remoteLogger.mu.RUnlock()
+			}
+		})
+	})
+
+	// Verify the announcement about the level change is visible.
+	want := "LOG_LEVEL updated from INFO to FATAL"
+
+	assert.Truef(t, strings.Contains(stdout, want) || strings.Contains(stderr, want),
+		"level change into FATAL must be announced")
+}
+
+func TestHTTPDebugMsg_PrettyPrint(t *testing.T) {
+	cases := []struct {
+		name         string
+		msg          httpDebugMsg
+		wantColorSeq string
+	}{
+		{
+			name: "2xx uses blue",
+			msg: httpDebugMsg{
+				CorrelationID: "corr-200",
+				ResponseCode:  200,
+				ResponseTime:  123,
+				HTTPMethod:    "GET",
+				URI:           "/ok",
+			},
+			wantColorSeq: fmt.Sprintf("\u001B[38;5;%dm", colorBlue),
+		},
+		{
+			name: "4xx uses yellow",
+			msg: httpDebugMsg{
+				CorrelationID: "corr-404",
+				ResponseCode:  404,
+				ResponseTime:  456,
+				HTTPMethod:    "POST",
+				URI:           "/not-found",
+			},
+			wantColorSeq: fmt.Sprintf("\u001B[38;5;%dm", colorYellow),
+		},
+		{
+			name: "5xx uses red",
+			msg: httpDebugMsg{
+				CorrelationID: "corr-500",
+				ResponseCode:  500,
+				ResponseTime:  789,
+				HTTPMethod:    "PUT",
+				URI:           "/err",
+			},
+			wantColorSeq: fmt.Sprintf("\u001B[38;5;%dm", colorRed),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tc.msg.PrettyPrint(&buf)
+			out := buf.String()
+
+			// basic content checks
+			assert.Contains(t, out, tc.msg.CorrelationID)
+			assert.Contains(t, out, tc.msg.HTTPMethod)
+			assert.Contains(t, out, tc.msg.URI)
+			assert.Contains(t, out, fmt.Sprintf("%d", tc.msg.ResponseCode))
+			// response time should include the microsecond suffix
+			assert.Contains(t, out, fmt.Sprintf("%dμs", tc.msg.ResponseTime))
+
+			// color sequence must be present
+			assert.Contains(t, out, tc.wantColorSeq, "expected color sequence %q in output: %q", tc.wantColorSeq, out)
+
+			// ensure reset code present
+			assert.Contains(t, out, "\u001B[0m")
+		})
+	}
+}
+
+// noGateLogger is a logging.Logger that cannot answer LogEnabled. Embedding the
+// INTERFACE (not a concrete logger) is what hides the method: only the
+// interface's own methods are promoted.
+type noGateLogger struct{ logging.Logger }
+
+// TestRemoteLoggerLogEnabledMatchesLevel is the direct test of the implementation
+// production actually uses -- container.go always wires a remotelogger, so this
+// is the LogEnabled the request middleware calls on every request.
+//
+// It is written to fail if the body is replaced with a constant: the expected
+// value differs across the table.
+func TestRemoteLoggerLogEnabledMatchesLevel(t *testing.T) {
+	tests := []struct {
+		level logging.Level
+		want  bool
+	}{
+		{logging.DEBUG, true},
+		{logging.INFO, true},
+		{logging.NOTICE, false},
+		{logging.WARN, false},
+		{logging.ERROR, false},
+		{logging.FATAL, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.level.String(), func(t *testing.T) {
+			// An empty remote URL keeps the polling goroutine from starting.
+			r, ok := New(tt.level, "", time.Second).(*remoteLogger)
+			require.True(t, ok)
+
+			assert.Equal(t, tt.want, r.LogEnabled())
+		})
+	}
+}
+
+// TestRemoteLoggerLogEnabledFollowsChangeLevel pins that the wrapper reports the
+// level currently in force, not the one it was built with -- the whole point of
+// delegating to the embedded logger rather than reading currentLevel.
+func TestRemoteLoggerLogEnabledFollowsChangeLevel(t *testing.T) {
+	r, ok := New(logging.INFO, "", time.Second).(*remoteLogger)
+	require.True(t, ok)
+	require.True(t, r.LogEnabled(), "INFO must start open")
+
+	r.ChangeLevel(logging.WARN)
+	assert.False(t, r.LogEnabled(), "a remote level raise must close the gate")
+
+	r.ChangeLevel(logging.DEBUG)
+	assert.True(t, r.LogEnabled(), "and lowering it must reopen it")
+}
+
+// TestRemoteLoggerLogEnabledFailsOpen covers the compatibility path: an embedded
+// logger that cannot answer must be treated as enabled, so a custom logger never
+// silently loses its request logs.
+func TestRemoteLoggerLogEnabledFailsOpen(t *testing.T) {
+	r := &remoteLogger{Logger: noGateLogger{logging.NewLogger(logging.FATAL)}}
+
+	assert.True(t, r.LogEnabled(),
+		"a logger without the optional interface must keep building entries")
+}
+
+// TestRemoteLoggerLogEnabledAgreesWithLog is the anti-drift guard, asserted
+// against real output rather than against the other implementation.
+func TestRemoteLoggerLogEnabledAgreesWithLog(t *testing.T) {
+	for _, level := range []logging.Level{logging.DEBUG, logging.INFO, logging.NOTICE, logging.WARN} {
+		t.Run(level.String(), func(t *testing.T) {
+			r, ok := New(level, "", time.Second).(*remoteLogger)
+			require.True(t, ok)
+
+			out := testutil.StdoutOutputForFunc(func() {
+				l, _ := New(level, "", time.Second).(*remoteLogger)
+				l.Log("entry")
+			})
+
+			assert.Equal(t, r.LogEnabled(), out != "",
+				"LogEnabled must predict whether Log emits")
+		})
+	}
+}
+
+// TestRemoteLogger_AllLevelTransitionsAnnounced covers issue #4101: a remote
+// level change must always be announced, whichever direction it goes. The
+// announcement previously used a fixed level and ran before ChangeLevel, so
+// several of the 30 transitions (those into or out of FATAL) were emitted at a
+// level the active gate discarded and vanished.
+//
+// This drives the real production path: a stub config service returns the new
+// level, New starts the polling goroutine, and UpdateLogLevel performs one
+// immediate check before ticking — so the assertion observes the actual
+// captured output of the shipped code, not a reimplementation of it. Removing
+// the fix makes these assertions fail.
+func TestRemoteLogger_AllLevelTransitionsAnnounced(t *testing.T) {
+	levels := []logging.Level{
+		logging.DEBUG, logging.INFO, logging.NOTICE,
+		logging.WARN, logging.ERROR, logging.FATAL,
+	}
+
+	for _, oldLevel := range levels {
+		for _, newLevel := range levels {
+			if oldLevel == newLevel {
+				continue
+			}
+
+			old, nw := oldLevel, newLevel
+			t.Run(fmt.Sprintf("%v_to_%v", old, nw), func(t *testing.T) {
+				// The stub config service signals when it has been polled, so
+				// the test can wait on the actual fetch instead of sleeping a
+				// fixed amount (which is both slow and flaky under load).
+				hit := make(chan struct{}, 1)
+				server := httptest.NewServer(http.HandlerFunc(
+					func(w http.ResponseWriter, _ *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						fmt.Fprintf(w, `{"data":{"serviceName":"test-service","logLevel":"%v"}}`, nw)
+
+						select {
+						case hit <- struct{}{}:
+						default:
+						}
+					}))
+				t.Cleanup(server.Close)
+
+				// Announcements at INFO/NOTICE/WARN go to stdout; ERROR goes to
+				// stderr. Capture both so the assertion does not depend on which
+				// stream a given level uses. A long fetch interval means only
+				// the immediate initial check runs, keeping the test
+				// deterministic.
+				var (
+					out string
+					rl  logging.Logger
+				)
+
+				stderr := testutil.StderrOutputForFunc(func() {
+					out = testutil.StdoutOutputForFunc(func() {
+						rl = New(old, server.URL, time.Hour)
+
+						select {
+						case <-hit:
+							// Give UpdateLogLevel a moment to apply the level and
+							// write the announcement after the fetch returns.
+							time.Sleep(50 * time.Millisecond)
+						case <-time.After(2 * time.Second):
+							t.Error("config service was never polled")
+						}
+					})
+				})
+
+				want := fmt.Sprintf("LOG_LEVEL updated from %v to %v", old, nw)
+
+				assert.Truef(t, strings.Contains(out, want) || strings.Contains(stderr, want),
+					"transition %v -> %v was silently dropped", old, nw)
+
+				// The announcement must reflect a level that was actually
+				// applied, not just logged.
+				if r, ok := rl.(*remoteLogger); ok {
+					r.mu.RLock()
+					assert.Equal(t, nw, r.currentLevel)
+					r.mu.RUnlock()
+				}
+			})
+		}
+	}
+}
+
+// noEntryLogger is a logging.Logger that cannot answer LogEntry/ErrorEntry.
+// Embedding the INTERFACE hides them for the same reason noGateLogger hides
+// LogEnabled, and it counts the fallback so a silent no-op cannot pass.
+type noEntryLogger struct {
+	logging.Logger
+	logCalls, errCalls int
+}
+
+func (n *noEntryLogger) Log(...any)   { n.logCalls++ }
+func (n *noEntryLogger) Error(...any) { n.errCalls++ }
+
+// TestRemoteLoggerResolvesEntryFastPath pins the production wiring: container.go
+// always builds the request logger through New, so if this assertion stops
+// holding the middleware's own entryLogger assertion stops matching too and the
+// allocation the fast path saves comes back -- with no test failing, because the
+// bytes logged are identical either way.
+func TestRemoteLoggerResolvesEntryFastPath(t *testing.T) {
+	r, ok := New(logging.INFO, "", time.Second).(*remoteLogger)
+	require.True(t, ok)
+
+	assert.NotNil(t, r.entries, "New must resolve the embedded logger's entry fast path once")
+}
+
+// TestRemoteLoggerLogEntryMatchesLog is the parity guarantee for the forwarder:
+// routing an entry through the fast path must not change a single byte of what
+// a service's log pipeline receives.
+func TestRemoteLoggerLogEntryMatchesLog(t *testing.T) {
+	viaLog := testutil.StdoutOutputForFunc(func() {
+		l, _ := New(logging.INFO, "", time.Second).(*remoteLogger)
+		l.Log(map[string]any{"uri": "/x", "response": 200})
+	})
+
+	viaEntry := testutil.StdoutOutputForFunc(func() {
+		l, _ := New(logging.INFO, "", time.Second).(*remoteLogger)
+		l.LogEntry(map[string]any{"uri": "/x", "response": 200})
+	})
+
+	require.NotEmpty(t, viaEntry, "LogEntry must actually emit")
+	assert.Equal(t, stripJSONTime(viaLog), stripJSONTime(viaEntry),
+		"LogEntry must produce byte-identical output to Log")
+}
+
+// TestRemoteLoggerErrorEntryMatchesError is the same parity on the path a 5xx
+// takes, which reaches a different writer and could regress on its own.
+func TestRemoteLoggerErrorEntryMatchesError(t *testing.T) {
+	viaError := testutil.StderrOutputForFunc(func() {
+		l, _ := New(logging.INFO, "", time.Second).(*remoteLogger)
+		l.Error(map[string]any{"uri": "/x", "response": 500})
+	})
+
+	viaEntry := testutil.StderrOutputForFunc(func() {
+		l, _ := New(logging.INFO, "", time.Second).(*remoteLogger)
+		l.ErrorEntry(map[string]any{"uri": "/x", "response": 500})
+	})
+
+	require.NotEmpty(t, viaEntry, "ErrorEntry must actually emit")
+	assert.Equal(t, stripJSONTime(viaError), stripJSONTime(viaEntry),
+		"ErrorEntry must produce byte-identical output to Error")
+}
+
+// TestRemoteLoggerEntryFallsBackWithoutFastPath is the compatibility half: an
+// embedded logger that never heard of LogEntry must still be logged through,
+// not silently dropped.
+func TestRemoteLoggerEntryFallsBackWithoutFastPath(t *testing.T) {
+	base := &noEntryLogger{Logger: logging.NewLogger(logging.INFO)}
+	r := &remoteLogger{Logger: base}
+
+	r.LogEntry("x")
+	r.ErrorEntry("y")
+
+	assert.Equal(t, 1, base.logCalls, "LogEntry must fall back to the embedded Log")
+	assert.Equal(t, 1, base.errCalls, "ErrorEntry must fall back to the embedded Error")
+}
+
+// TestRemoteLoggerLogEntryFollowsChangeLevel pins the one thing forwarding could
+// break: the remote logger does not gate LogEntry itself, it pushes the level
+// down with ChangeLevel and trusts the embedded logger to apply it. If that
+// stopped being true, a remote level raise would stop suppressing request logs.
+func TestRemoteLoggerLogEntryFollowsChangeLevel(t *testing.T) {
+	out := testutil.StdoutOutputForFunc(func() {
+		l, _ := New(logging.INFO, "", time.Second).(*remoteLogger)
+		l.ChangeLevel(logging.FATAL)
+		l.LogEntry("must not survive a raise to FATAL")
+	})
+
+	assert.Empty(t, out, "a level raised through ChangeLevel must suppress the fast path too")
+}
+
+// stripJSONTime removes the timestamp field, which necessarily differs between
+// two calls and is not what the parity tests compare.
+func stripJSONTime(s string) string {
+	i := strings.Index(s, `"time":`)
+	if i < 0 {
+		return s
+	}
+
+	j := strings.Index(s[i:], `,`)
+	if j < 0 {
+		return s
+	}
+
+	return s[:i] + s[i+j+1:]
+}

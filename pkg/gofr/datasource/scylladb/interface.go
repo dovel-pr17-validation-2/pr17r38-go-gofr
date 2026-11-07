@@ -1,0 +1,46 @@
+package scylladb
+
+import (
+	"context"
+
+	"github.com/gocql/gocql"
+)
+
+// clusterConfig defines methods for interacting with a ScyllaDB clusterConfig.
+type clusterConfig interface {
+	createSession() (session, error)
+}
+
+// iterator defines methods for interacting with a ScyllaDB iterator.
+type iterator interface {
+	Columns() []gocql.ColumnInfo
+	Scan(dest ...any) bool
+	NumRows() int
+	// Close releases the iterator and returns the first error encountered
+	// while executing the query, if any. gocql only surfaces a failed
+	// query through Close, not through Scan or NumRows.
+	Close() error
+}
+
+// query defines methods for interacting with a ScyllaDB query.
+type query interface {
+	Exec() error
+	ExecWithCtx(ctx context.Context) error
+	Iter() iterator
+	MapScanCAS(dest map[string]any) (applied bool, err error)
+	ScanCAS(dest ...any) (applied bool, err error)
+}
+
+// batch defines methods for interacting with a ScyllaDB batch.
+type batch interface {
+	Query(stmt string, args ...any)
+	getBatch() *gocql.Batch
+}
+
+// session defines methods for interacting with a ScyllaDB session.
+type session interface {
+	Query(stmt string, values ...any) query
+	newBatch(batchType gocql.BatchType) batch
+	executeBatch(batch batch) error
+	executeBatchCAS(batch batch, dest ...any) (bool, error)
+}

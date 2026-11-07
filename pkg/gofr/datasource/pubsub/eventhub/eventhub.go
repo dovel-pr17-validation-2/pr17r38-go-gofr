@@ -1,0 +1,647 @@
+package eventhub
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs/checkpoints"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"go.opentelemetry.io/otel/trace"
+	"gofr.dev/pkg/gofr/datasource"
+	"gofr.dev/pkg/gofr/datasource/pubsub"
+	"golang.org/x/sync/singleflight"
+)
+
+// code reference from https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-go-get-started-send
+// metrics are being registered in the container, and we are using the same metrics so we have not re-registered the metrics here.
+// It is different from other datasources.
+
+var (
+	ErrNoMsgReceived      = errors.New("no message received")
+	ErrTopicMismatch      = errors.New("topic should be same as Event Hub name")
+	errClientNotConnected = errors.New("eventhub client not connected")
+	errEmptyTopic         = errors.New("topic name cannot be empty")
+	errProbeInFlight      = errors.New("eventhub health probe already in progress")
+)
+
+const (
+	defaultQueryTimeout     = 30 * time.Second
+	eventHubPropsTimeout    = 2 * time.Second
+	basicTierMaxPartitions  = 2
+	basicTierReceiveTimeout = 3 * time.Second
+
+	// healthProbeKey names the single in-flight probe. There is only ever one per client, so the
+	// key is constant; it exists only because singleflight is keyed by design.
+	healthProbeKey = "probe"
+
+	// backendName identifies Event Hub in query logs.
+	backendName = "EVHUB"
+)
+
+type Config struct {
+	ConnectionString          string
+	ContainerConnectionString string
+	StorageServiceURL         string
+	StorageContainerName      string
+	EventhubName              string
+	// if not provided, it will read from the $Default consumergroup.
+	ConsumerGroup string
+	// the following configs are for advance setup of the Event Hub.
+	StorageOptions   *container.ClientOptions
+	BlobStoreOptions *checkpoints.BlobStoreOptions
+	ConsumerOptions  *azeventhubs.ConsumerClientOptions
+	ProducerOptions  *azeventhubs.ProducerClientOptions
+}
+
+// consumerClient is the part of *azeventhubs.ConsumerClient this package uses. It exists so the
+// health probe can be exercised without a live namespace -- the same seam the SQS client uses for
+// its own health tests. The partition READS cannot: NewPartitionClient hands back the concrete
+// *azeventhubs.PartitionClient and ReceiveEvents is called on that, and the zero value of that
+// type nil-derefs. So a fake can decide which partition IDs come back and whether opening a
+// partition client fails, but not what reading one returns.
+type consumerClient interface {
+	GetEventHubProperties(ctx context.Context, options *azeventhubs.GetEventHubPropertiesOptions) (azeventhubs.EventHubProperties, error)
+	NewPartitionClient(partitionID string, options *azeventhubs.PartitionClientOptions) (*azeventhubs.PartitionClient, error)
+	Close(ctx context.Context) error
+}
+
+type Client struct {
+	producer *azeventhubs.ProducerClient
+	// consumer is written once by Connect and read without synchronization by Health, Subscribe
+	// and Close, so Connect must happen-before any of them -- which is what AddPubSub does. Note
+	// that as an interface this is two words, so a concurrent Connect can be observed half-written
+	// and pass a "!= nil" guard with a nil value behind it; as a pointer it could only be observed
+	// nil or whole. Synchronizing the field is a separate change.
+	consumer consumerClient
+	// we are using a processor such that to keep consuming the events from all the different partitions.
+	processor *azeventhubs.Processor
+	// a checkpoint is being called while committing the event received from the event.
+	checkPoint *checkpoints.BlobStore
+	// processorCtx is being stored such that to gracefully shutting down the application.
+	processorCtx context.CancelFunc
+	cfg          Config
+	logger       Logger
+	metrics      Metrics
+	tracer       trace.Tracer
+	// probeGroup caps in-flight health probes at one and shares that probe's result across every
+	// concurrent poller. A probe can outlive its deadline parked in the SDK (see probeWithin), so
+	// without a cap a broker that accepts a connection but never answers would strand a goroutine on
+	// every health poll -- an unbounded leak. singleflight collapses concurrent polls onto the one
+	// parked probe, so a healthy broker still reports up to every caller.
+	probeGroup singleflight.Group
+}
+
+// New Creates the client for Event Hub.
+//
+//nolint:gocritic // cfg is a configuration struct.
+func New(cfg Config) *Client {
+	return &Client{
+		cfg: cfg,
+	}
+}
+
+//nolint:gocritic // cfg is a configuration struct.
+func (c *Client) validConfigs(cfg Config) bool {
+	ok := true
+
+	if cfg.EventhubName == "" {
+		ok = false
+
+		c.logger.Error("eventhubName cannot be an empty")
+	}
+
+	if cfg.ConnectionString == "" {
+		ok = false
+
+		c.logger.Error("connectionString cannot be an empty")
+	}
+
+	if cfg.StorageServiceURL == "" {
+		ok = false
+
+		c.logger.Error("storageServiceURL cannot be an empty")
+	}
+
+	if cfg.StorageContainerName == "" {
+		ok = false
+
+		c.logger.Error("storageContainerName cannot be an empty")
+	}
+
+	if cfg.ContainerConnectionString == "" {
+		ok = false
+
+		c.logger.Error("containerConnectionString cannot be an empty")
+	}
+
+	return ok
+}
+
+// UseLogger sets the logger for the Event Hub client.
+func (c *Client) UseLogger(logger any) {
+	if l, ok := logger.(Logger); ok {
+		c.logger = l
+	}
+}
+
+// UseMetrics sets the metrics for the Event Hub client.
+func (c *Client) UseMetrics(metrics any) {
+	if m, ok := metrics.(Metrics); ok {
+		c.metrics = m
+	}
+}
+
+// UseTracer sets the tracer for the Event Hub client.
+func (c *Client) UseTracer(tracer any) {
+	if t, ok := tracer.(trace.Tracer); ok {
+		c.tracer = t
+	}
+}
+
+// Connect establishes a connection to Event Hub and registers metrics using the provided configuration when the client was Created.
+func (c *Client) Connect() {
+	if !c.validConfigs(c.cfg) {
+		return
+	}
+
+	if c.cfg.ConsumerGroup == "" {
+		c.cfg.ConsumerGroup = azeventhubs.DefaultConsumerGroup
+		c.logger.Debugf("Using default consumer group: %s", c.cfg.ConsumerGroup)
+	} else {
+		c.logger.Debugf("Using provided consumer group: %s", c.cfg.ConsumerGroup)
+	}
+
+	c.logger.Debug("Event Hub connection started using connection string")
+
+	producerClient, err := azeventhubs.NewProducerClientFromConnectionString(c.cfg.ConnectionString,
+		c.cfg.EventhubName, c.cfg.ProducerOptions)
+	if err != nil {
+		c.logger.Errorf("error occurred while creating producer client %v", err)
+
+		return
+	}
+
+	c.logger.Debug("Event Hub producer client setup success")
+
+	containerClient, err := container.NewClientFromConnectionString(c.cfg.ContainerConnectionString, c.cfg.StorageContainerName,
+		c.cfg.StorageOptions)
+	if err != nil {
+		c.logger.Errorf("error occurred while creating container client %v", err)
+
+		return
+	}
+
+	c.logger.Debug("Event Hub container client setup success")
+
+	// create a checkpoint store that will be used by the event hub
+	checkpointStore, err := checkpoints.NewBlobStore(containerClient, c.cfg.BlobStoreOptions)
+	if err != nil {
+		c.logger.Errorf("error occurred while creating blobstore %v", err)
+
+		return
+	}
+
+	c.logger.Debug("Event Hub blobstore client setup success")
+
+	// create a consumer client using a connection string to the namespace and the event hub
+	consumer, err := azeventhubs.NewConsumerClientFromConnectionString(c.cfg.ConnectionString, c.cfg.EventhubName,
+		c.cfg.ConsumerGroup, c.cfg.ConsumerOptions)
+	if err != nil {
+		c.logger.Errorf("error occurred while creating consumer client %v", err)
+
+		return
+	}
+
+	c.logger.Debug("Event Hub consumer client setup success")
+
+	// create a processor to receive and process events
+	processor, err := azeventhubs.NewProcessor(consumer, checkpointStore, nil)
+	if err != nil {
+		c.logger.Errorf("error occurred while creating processor %v", err)
+
+		return
+	}
+
+	c.logger.Debug("Event Hub processor setup success")
+
+	processorCtx, processorCancel := context.WithCancel(context.TODO())
+	c.processorCtx = processorCancel
+
+	// it is being run in a go-routine as it is a never ending process and has to be kept running to subscribe to events.
+	go func() {
+		if err = processor.Run(processorCtx); err != nil {
+			c.logger.Errorf("error occurred while running processor %v", err)
+
+			return
+		}
+
+		c.logger.Debug("Event Hub processor running successfully")
+	}()
+
+	c.processor = processor
+	c.producer = producerClient
+	c.consumer = consumer
+	c.checkPoint = checkpointStore
+
+	c.logger.Debug("Event Hub client initialization complete")
+}
+
+// Subscribe checks all partitions for the first available event and returns it.
+func (c *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
+	if c.producer == nil || c.consumer == nil || c.processor == nil {
+		return nil, errClientNotConnected
+	}
+
+	// Try processor approach first
+	partitionClient := c.processor.NextPartitionClient(ctx)
+	if partitionClient != nil {
+		return c.processEventsFromPartitionClient(ctx, topic, partitionClient)
+	}
+
+	// Fallback to direct consumer approach if processor doesn't have partition clients ready
+	return c.subscribeDirectFromConsumer(ctx, topic)
+}
+
+// processEventsFromPartitionClient processes events using the processor partition client.
+func (c *Client) processEventsFromPartitionClient(ctx context.Context, topic string,
+	partitionClient *azeventhubs.ProcessorPartitionClient) (*pubsub.Message, error) {
+	defer closePartitionResources(ctx, partitionClient)
+
+	timeout := c.getReceiveTimeout()
+
+	receiveCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic, "subscription_name", partitionClient.PartitionID())
+
+	start := time.Now()
+
+	// ReceiveEvents signature: ReceiveEvents(ctx context.Context, count int, options *ReceiveEventsOptions) ([]*ReceivedEventData, error)
+	// Note: ReceiveEventsOptions is nil for default behavior.
+	events, err := partitionClient.ReceiveEvents(receiveCtx, 1, nil)
+	if err != nil {
+		if !errors.Is(err, context.DeadlineExceeded) {
+			c.logger.Debugf("Error receiving events from partition %s: %v", partitionClient.PartitionID(), err)
+		}
+
+		return nil, nil
+	}
+
+	if len(events) == 0 {
+		return nil, nil
+	}
+
+	// Create message from the first event
+	msg := pubsub.NewMessage(ctx)
+	msg.Value = events[0].Body
+	msg.Committer = &Message{
+		event:     events[0],
+		processor: partitionClient,
+		logger:    c.logger,
+	}
+	msg.Topic = topic
+	msg.MetaData = events[0].EventData
+
+	end := time.Since(start)
+	c.logger.Debug(&Log{
+		Mode:          "SUB",
+		MessageValue:  strings.Join(strings.Fields(string(msg.Value)), " "),
+		Topic:         topic,
+		Host:          c.cfg.EventhubName + ":" + c.cfg.ConsumerGroup + ":" + partitionClient.PartitionID(),
+		PubSubBackend: backendName,
+		Time:          end.Microseconds(),
+	})
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic, "subscription_name", partitionClient.PartitionID())
+
+	return msg, nil
+}
+
+// subscribeDirectFromConsumer uses consumer client directly as fallback.
+func (c *Client) subscribeDirectFromConsumer(ctx context.Context, topic string) (*pubsub.Message, error) {
+	// Get partition information
+	props, err := c.consumer.GetEventHubProperties(ctx, nil)
+	if err != nil {
+		c.logger.Errorf("Failed to get Event Hub properties: %v", err)
+		return nil, err
+	}
+
+	// Try each partition for available messages - use LATEST to avoid old messages
+	for _, partitionID := range props.PartitionIDs {
+		msg, err := c.tryReadFromPartition(ctx, partitionID, topic)
+		if err != nil {
+			c.logger.Debugf("Error reading from partition %s: %v", partitionID, err)
+			continue
+		}
+
+		if msg != nil {
+			return msg, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// tryReadFromPartition attempts to read a single message from specified partition.
+func (c *Client) tryReadFromPartition(ctx context.Context, partitionID, topic string) (*pubsub.Message, error) {
+	// Create partition client for direct read with LATEST position to avoid old messages.
+	partitionClient, err := c.consumer.NewPartitionClient(partitionID, &azeventhubs.PartitionClientOptions{
+		StartPosition: azeventhubs.StartPosition{
+			Latest: to.Ptr(true), // Use Latest to only get new messages
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer partitionClient.Close(ctx)
+
+	timeout := c.getReceiveTimeout()
+
+	receiveCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic, "subscription_name", partitionID)
+
+	start := time.Now()
+
+	events, err := partitionClient.ReceiveEvents(receiveCtx, 1, nil)
+
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+
+	if len(events) == 0 {
+		return nil, nil // No message available in this partition
+	}
+
+	// Create message from event
+	msg := pubsub.NewMessage(ctx)
+
+	msg.Value = events[0].Body
+	msg.Committer = &Message{
+		event:     events[0],
+		processor: nil, // Not using processor for direct reads
+		logger:    c.logger,
+	}
+	msg.Topic = topic
+	msg.MetaData = events[0].EventData
+
+	end := time.Since(start)
+	c.logger.Debug(&Log{
+		Mode:          "SUB",
+		MessageValue:  strings.Join(strings.Fields(string(msg.Value)), " "),
+		Topic:         topic,
+		Host:          c.cfg.EventhubName + ":" + c.cfg.ConsumerGroup + ":" + partitionID,
+		PubSubBackend: backendName,
+		Time:          end.Microseconds(),
+	})
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic, "subscription_name", partitionID)
+
+	return msg, nil
+}
+
+// getReceiveTimeout returns appropriate timeout based on Event Hub characteristics.
+func (c *Client) getReceiveTimeout() time.Duration {
+	// Check if this might be basic tier by examining partition count
+	if c.isLikelyBasicTier() {
+		return basicTierReceiveTimeout
+	}
+
+	return time.Second
+}
+
+// isLikelyBasicTier detects basic tier characteristics.
+func (c *Client) isLikelyBasicTier() bool {
+	if c.consumer == nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), eventHubPropsTimeout)
+	defer cancel()
+
+	props, err := c.consumer.GetEventHubProperties(ctx, nil)
+	if err != nil {
+		return false // Default to standard behavior on error
+	}
+
+	// Basic tier typically has fewer partitions
+	return len(props.PartitionIDs) <= basicTierMaxPartitions
+}
+
+func closePartitionResources(ctx context.Context, partitionClient *azeventhubs.ProcessorPartitionClient) {
+	partitionClient.Close(ctx)
+}
+
+func (c *Client) Publish(ctx context.Context, topic string, message []byte) error {
+	if c.producer == nil {
+		return errClientNotConnected
+	}
+
+	if topic != c.cfg.EventhubName {
+		return ErrTopicMismatch
+	}
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_publish_total_count", "topic", topic)
+
+	newBatchOptions := &azeventhubs.EventDataBatchOptions{}
+
+	batch, err := c.producer.NewEventDataBatch(ctx, newBatchOptions)
+	if err != nil {
+		c.logger.Errorf("failed to create event batch %v", err)
+
+		return err
+	}
+
+	data := []*azeventhubs.EventData{{
+		Body: message,
+	}}
+
+	for i := 0; i < len(data); i++ {
+		err = batch.AddEventData(data[i], nil)
+		if err != nil {
+			c.logger.Debugf("failed to add event data to batch %v", err)
+		}
+	}
+
+	start := time.Now()
+
+	// send the batch of events to the event hub
+	if err := c.producer.SendEventDataBatch(ctx, batch, nil); err != nil {
+		return err
+	}
+
+	end := time.Since(start)
+
+	c.logger.Debug(&Log{
+		Mode:          "PUB",
+		MessageValue:  strings.Join(strings.Fields(string(message)), " "),
+		Topic:         topic,
+		Host:          c.cfg.EventhubName,
+		PubSubBackend: backendName,
+		Time:          end.Microseconds(),
+	})
+
+	c.metrics.IncrementCounter(ctx, "app_pubsub_publish_success_count", "topic", topic)
+
+	return nil
+}
+
+func (c *Client) Health() datasource.Health {
+	health := datasource.Health{
+		Status: datasource.StatusDown,
+		Details: map[string]any{
+			"backend":  "EVENT_HUB",
+			"eventHub": c.cfg.EventhubName,
+		},
+	}
+
+	if c.consumer == nil {
+		health.Details["error"] = errClientNotConnected.Error()
+
+		return health
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), eventHubPropsTimeout)
+	defer cancel()
+
+	props, err := c.probeWithin(ctx)
+	if err != nil {
+		health.Details["error"] = err.Error()
+
+		return health
+	}
+
+	health.Status = datasource.StatusUp
+	health.Details["partitionCount"] = len(props.PartitionIDs)
+
+	return health
+}
+
+// probeWithin runs the connectivity probe and returns when ctx expires whether or not the probe
+// has.
+//
+// Passing ctx to GetEventHubProperties is not enough to bound it. In azeventhubs v1.4.0 that
+// method hands context.Background() to rpcLink.RPC (mgmt.go:67), and the wait for the reply
+// selects on *that* context (internal/rpc.go:263), so our deadline never fires there. The same
+// Background context also has no deadline to derive the AMQP "server-timeout" property from
+// (internal/rpc.go:244), so the broker-side bound is absent too. What ctx does bound is link
+// acquisition and the sleeps between retries -- which is why an unresolvable host still returns
+// promptly, and why the bound looks correct until a broker accepts a request and never answers.
+//
+// Running the call on its own goroutine and selecting here makes the deadline ours. The cost is
+// that an abandoned probe stays parked until the SDK returns.
+//
+// probeGroup (singleflight) caps that cost at a single parked goroutine AND shares its result:
+// concurrent polls collapse onto the one in-flight probe rather than each spawning another, so a
+// broker stuck in this state strands at most one goroutine no matter the poll rate, and a healthy
+// broker still reports up to every concurrent caller. The probe runs on its own background-derived
+// deadline, not any single caller's, so a caller that gives up cannot cancel the probe the others
+// are still waiting on -- ctx here only bounds how long THIS caller waits. A caller whose deadline
+// expires while the probe is still parked reports errProbeInFlight (down): the broker is
+// unresponsive to it, and the shared probe stays capped rather than being piled on.
+func (c *Client) probeWithin(ctx context.Context) (azeventhubs.EventHubProperties, error) {
+	result := c.probeGroup.DoChan(healthProbeKey, func() (any, error) {
+		// Own deadline, decoupled from any caller: it bounds link acquisition and retry sleeps
+		// (all ctx ever bounded here -- see above) without being canceled when a caller leaves.
+		probeCtx, cancel := context.WithTimeout(context.Background(), eventHubPropsTimeout)
+		defer cancel()
+
+		return c.consumer.GetEventHubProperties(probeCtx, nil)
+	})
+
+	select {
+	case res := <-result:
+		if res.Err != nil {
+			return azeventhubs.EventHubProperties{}, res.Err
+		}
+
+		return res.Val.(azeventhubs.EventHubProperties), nil
+	case <-ctx.Done():
+		return azeventhubs.EventHubProperties{}, errProbeInFlight
+	}
+}
+
+func (c *Client) CreateTopic(_ context.Context, name string) error {
+	// For Event Hub, creating topics is not supported, but we don't want to fail migrations
+	if name == "gofr_migrations" {
+		return nil
+	}
+
+	c.logger.Error("topic creation is not supported in Event Hub")
+
+	return nil
+}
+
+func (c *Client) DeleteTopic(context.Context, string) error {
+	c.logger.Error("topic deletion is not supported in Event Hub")
+
+	return nil
+}
+
+// Query retrieves messages from Azure Event Hub.
+func (c *Client) Query(ctx context.Context, query string, args ...any) ([]byte, error) {
+	if c.consumer == nil {
+		return nil, errClientNotConnected
+	}
+
+	if query == "" {
+		return nil, errEmptyTopic
+	}
+
+	if query != c.cfg.EventhubName {
+		return nil, ErrTopicMismatch
+	}
+
+	startPosition, limit := c.parseQueryArgs(args...)
+
+	// Use provided context or add default timeout
+	readCtx := ctx
+
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+
+		readCtx, cancel = context.WithTimeout(ctx, defaultQueryTimeout)
+		defer cancel()
+	}
+
+	return c.readMessages(readCtx, startPosition, limit)
+}
+
+func (c *Client) GetEventHubName() string {
+	return c.cfg.EventhubName
+}
+
+// Close safely closes all Event Hub clients and resources.
+func (c *Client) Close() error {
+	var lastErr error
+
+	// Close producer if it exists
+	if c.producer != nil {
+		if err := c.producer.Close(context.Background()); err != nil {
+			c.logger.Errorf("failed to close Event Hub producer: %v", err)
+			lastErr = err
+		}
+	}
+
+	// Close consumer if it exists
+	if c.consumer != nil {
+		if err := c.consumer.Close(context.Background()); err != nil {
+			c.logger.Errorf("failed to close Event Hub consumer: %v", err)
+			lastErr = err
+		}
+	}
+
+	// Cancel processor context if it exists
+	if c.processorCtx != nil {
+		c.processorCtx()
+		c.logger.Debug("Event Hub processor context canceled")
+	}
+
+	return lastErr
+}

@@ -1,0 +1,471 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
+	gofrhttp "gofr.dev/pkg/gofr/http"
+)
+
+type metrics interface {
+	IncrementCounter(ctx context.Context, name string, labels ...string)
+	DeltaUpDownCounter(ctx context.Context, name string, value float64, labels ...string)
+	RecordHistogram(ctx context.Context, name string, value float64, labels ...string)
+	SetGauge(name string, value float64, labels ...string)
+}
+
+// metricsAttrer is the optional fast-path interface — when the concrete
+// metrics implementation provides RecordHistogramAttrs, the middleware
+// uses pre-built attribute slices instead of the string varargs path,
+// avoiding the per-request attribute conversion in
+// metricsManager.getAttributes. Not part of the public metrics.Manager
+// interface, so external implementers are unaffected — they fall back to
+// RecordHistogram.
+type metricsAttrer interface {
+	RecordHistogramAttrs(ctx context.Context, name string, value float64, attrs ...attribute.KeyValue)
+}
+
+// routeMethodKey identifies a (path-template, method) pair for caching
+// the precomputed attribute slice for app_http_response.
+type routeMethodKey struct {
+	path, method string
+}
+
+// graphqlPath is the canonical GraphQL endpoint that the Metrics
+// middleware skips — GraphQL has its own dedicated app_graphql_*
+// metrics, so recording app_http_response for it would double-count.
+const graphqlPath = "/graphql"
+
+// MetricsOption configures the Metrics middleware.
+type MetricsOption func(*metricsOptions)
+
+// metricsOptions holds the inputs to the caller-controlled label budget. Each
+// option records only its own input; untemplatedLimit combines them after all
+// options have run, so the order they are passed in cannot change the result.
+type metricsOptions struct {
+	ceiling        int
+	unmatchedLimit int64
+}
+
+// WithCardinalityLimit sizes the budget for caller-controlled label sets from
+// the meter provider's per-instrument datapoint ceiling, so that unmatched
+// traffic can take at most a quarter of it and the route table keeps the rest.
+// A ceiling of zero or less means unlimited, and the budget stays at
+// untemplatedLabelLimit because memory still needs a bound. A ceiling below
+// untemplatedCeilingShare gives a budget of zero: every caller-controlled
+// request collapses from the first one.
+//
+// The budget belongs to this Metrics instance, while the admitted set is shared
+// process-wide (see untemplatedLabels). Two instances built with different
+// ceilings each stop admitting at their own budget, so both stay bounded.
+func WithCardinalityLimit(limit int) MetricsOption {
+	return func(o *metricsOptions) {
+		o.ceiling = limit
+	}
+}
+
+// WithUnmatchedLimit lowers the budget for caller-controlled label sets to at
+// most limit, without touching the provider ceiling that real routes share. It
+// only ever lowers the budget: one above what WithCardinalityLimit allows, or
+// above untemplatedLabelLimit, has no effect. A limit of zero or less collapses
+// every caller-controlled request from the first one, which suits short-lived
+// instances that would each otherwise record their own scanner paths.
+func WithUnmatchedLimit(limit int) MetricsOption {
+	return func(o *metricsOptions) {
+		o.unmatchedLimit = int64(max(limit, 0))
+	}
+}
+
+func newMetricsOptions(opts ...MetricsOption) metricsOptions {
+	o := metricsOptions{unmatchedLimit: untemplatedLabelLimit}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	return o
+}
+
+// untemplatedLimit is the budget this Metrics instance admits caller-controlled
+// label sets against.
+func (o metricsOptions) untemplatedLimit() int64 {
+	return min(untemplatedBudget(o.ceiling), o.unmatchedLimit)
+}
+
+// untemplatedCeilingShare is the inverse of the fraction of the provider ceiling
+// that caller-controlled label sets may occupy. The budget counts the same unit
+// the ceiling counts -- distinct (path, method, status) attribute sets -- so it
+// really is a quarter of the datapoints, not a quarter of the (path, method)
+// pairs. On top of it sit only the collapsed __unmatched__ / __other__ series,
+// one per status the handlers return.
+const untemplatedCeilingShare = 4
+
+func untemplatedBudget(ceiling int) int64 {
+	if ceiling <= 0 {
+		return untemplatedLabelLimit
+	}
+
+	return min(int64(untemplatedLabelLimit), int64(ceiling/untemplatedCeilingShare))
+}
+
+// Metrics is a middleware that records request response time metrics using the provided metrics interface.
+func Metrics(metrics metrics, opts ...MetricsOption) func(inner http.Handler) http.Handler {
+	// The recording strategy is selected once, here, from what the metrics
+	// backend supports. The per-request path then makes a single call and
+	// carries none of that branching itself.
+	recorder := newHistogramRecorder(metrics)
+
+	untemplatedLimit := newMetricsOptions(opts...).untemplatedLimit()
+
+	return func(inner http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If an outer middleware (Logging) has already wrapped w in a
+			// StatusResponseWriter, reuse it instead of double-wrapping. Both
+			// middlewares only read status — a single wrapper captures it for
+			// both, saving one allocation per request.
+			srw, ok := w.(*StatusResponseWriter)
+			if !ok {
+				srw = &StatusResponseWriter{ResponseWriter: w}
+			}
+
+			path, templated := metricsPath(r)
+
+			// Skip recording for /graphql — it has its own dedicated metrics
+			// (app_graphql_*). time.Now() (vDSO call) is deferred past this
+			// branch so /graphql does not pay for a timestamp we throw away.
+			if path == graphqlPath {
+				inner.ServeHTTP(srw, r)
+				return
+			}
+
+			start := time.Now()
+
+			// this has to be called in the end so that status code is populated.
+			// res.Status() normalizes a zero internal status (handler wrote
+			// nothing, net/http implicit-200) to http.StatusOK so neither the
+			// histogram nor any status cache is poisoned with status=0.
+			defer func(res *StatusResponseWriter, req *http.Request) {
+				status := res.Status()
+				pathLabel, methodLabel := metricLabels(path, req.Method, status, templated, untemplatedLimit)
+				recorder.record(pathLabel, methodLabel, status,
+					time.Since(start).Seconds(), templated)
+			}(srw, r)
+
+			inner.ServeHTTP(srw, r)
+		})
+	}
+}
+
+// The labels recorded for a request whose path or method is caller-controlled
+// rather than drawn from the route table.
+//
+// A histogram retains one datapoint per distinct attribute set for the life of
+// the process, and the set is keyed on the (path, method, status) triple. Both
+// halves of that key come off the request for anything that does not resolve to
+// a route template: net/http accepts any RFC 7230 token as a method, and GoFr's
+// PathPrefix("/") catch-all -- registered with no .Methods() restriction -- means
+// an unmatched request still runs this middleware rather than being turned away.
+//
+// The meter provider caps datapoints per instrument: the SDK default of 2000,
+// OTEL_GO_X_CARDINALITY_LIMIT, or METRICS_CARDINALITY_LIMIT, which takes
+// precedence. Datapoints past that ceiling are folded into a single overflow
+// series, so junk arriving first evicts nothing but occupies the slots, and the
+// REAL routes registered afterwards are the ones that vanish from the dashboard.
+// Collapsing caller-controlled labels keeps the junk to one series and leaves the
+// ceiling for routes that matter.
+//
+// It is also the only bound on memory when that ceiling is configured away
+// (METRICS_CARDINALITY_LIMIT=0 means unlimited): every series pins a datapoint,
+// and exporters re-send every held series on every interval.
+const (
+	unmatchedPathLabel = "__unmatched__"
+	otherMethodLabel   = "__other__"
+
+	// untemplatedLabelLimit is the most distinct caller-controlled
+	// (path, method, status) label sets recorded verbatim before path and method
+	// collapse. WithCardinalityLimit lowers it to a quarter of a smaller provider
+	// ceiling, and WithUnmatchedLimit (METRICS_UNMATCHED_LIMIT) lowers it to a
+	// value of the user's choosing; neither ever raises it.
+	//
+	// It bounds the whole attribute set rather than each label separately,
+	// because independent ceilings multiply: 4096 paths and 64 methods is a
+	// quarter of a million possible series, and every status a pair is seen with
+	// multiplies that again. The attribute set is the quantity the provider
+	// ceiling counts, so it is the one bounded here.
+	//
+	// The value is a quarter of the SDK default provider ceiling (2000),
+	// so caller-controlled series cannot crowd out the route table. It also sits
+	// below routeCacheLimit on purpose: this check fires first, so routeCache's
+	// own refusal to store past its limit never triggers for this set.
+	untemplatedLabelLimit = 500
+)
+
+// untemplatedLabels is the set of caller-controlled (path, method, status)
+// label sets admitted verbatim.
+//
+// It is process-wide, unlike the per-Metrics() recorder caches, because the
+// resource it protects -- the meter provider's datapoint table -- is also
+// process-wide. The budget checked against it is per Metrics() instance; see
+// WithCardinalityLimit.
+//
+// Admission is check-then-act, so concurrent first sightings can overshoot by
+// roughly the number of requests in flight. The overshoot is bounded by
+// concurrency rather than by the caller, and the population stays finite.
+//
+// Admission is first-come and nothing is ever evicted. That mirrors the
+// resource: exporters.Build always installs the Prometheus reader, and
+// Prometheus is cumulative, so at least one pipeline keeps every recorded
+// series for the life of the process whatever temporality a push exporter
+// uses. Evicting a label set here would free nothing there, and admitting a
+// new one in its place would mint another datapoint -- this set would stop
+// bounding anything. (Only if the Prometheus reader failed to initialize and a
+// delta push reader were the sole pipeline would the SDK free datapoints that
+// this set still holds; that is narrow enough to accept.) The accepted cost is that
+// a burst of junk early in the process fills the set, after which other
+// untemplated traffic, static assets included, is recorded as __unmatched__. It
+// is still counted and timed, only not per path. Templated routes never reach
+// the set and are unaffected.
+//
+// Tests that assert on this set reset it and must not call t.Parallel().
+//
+//nolint:gochecknoglobals // process-wide by necessity: see above.
+var untemplatedLabels routeCache[struct{}]
+
+// untemplatedKey identifies one caller-controlled attribute set.
+type untemplatedKey struct {
+	path, method string
+	status       int
+}
+
+// metricLabels returns the path and method labels to record.
+//
+// A templated path and a standard method are bounded by construction and are
+// always recorded as themselves. Anything else is recorded verbatim until the
+// ceiling and collapses afterwards, which keeps existing behavior -- recording
+// the raw path for unrouted and static requests, and the verbatim method
+// including custom verbs, are both deliberately tested -- while stopping a
+// caller from filling the datapoint table.
+func metricLabels(path, method string, status int, templated bool, limit int64) (pathLabel, methodLabel string) {
+	standardMethod := cacheableMethod(method)
+	if templated && standardMethod {
+		return path, method
+	}
+
+	key := untemplatedKey{path: path, method: method, status: status}
+	if _, admitted := untemplatedLabels.load(key); admitted {
+		return path, method
+	}
+
+	if untemplatedLabels.len() >= limit {
+		if !templated {
+			path = unmatchedPathLabel
+		}
+
+		if !standardMethod {
+			method = otherMethodLabel
+		}
+
+		return path, method
+	}
+
+	untemplatedLabels.store(key, struct{}{})
+
+	return path, method
+}
+
+// metricsPath resolves the path label and reports whether it is a bounded route
+// template.
+//
+// The label itself is unchanged. What is new is the second return value, which
+// decides whether the result may be used as a cache key. Every branch that falls
+// back to r.URL.Path yields a caller-controlled string: an unmatched route, a
+// static-asset extension, /static, and - crucially - the "/" template that
+// GoFr's PathPrefix("/") catch-all produces for every unmatched request. Without
+// this distinction a stream of unique unmatched paths filled the shared cache to
+// its ceiling, after which every first-seen LEGITIMATE route could never be
+// stored and rebuilt its measurement option per request forever. Memory stayed
+// bounded; the optimization silently reverted to baseline for real traffic.
+func metricsPath(r *http.Request) (path string, templated bool) {
+	path = gofrhttp.RouteTemplate(r)
+	templated = path != ""
+
+	// It is "" for unmatched routes and for routes built without an explicit
+	// Path() (e.g. PathPrefix-only handlers), so fall back to r.URL.Path there
+	// to keep a usable path label rather than an empty key.
+	if !templated {
+		path = r.URL.Path
+	}
+
+	ext := strings.ToLower(filepath.Ext(r.URL.Path))
+	switch ext {
+	case ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".txt", ".html", ".json", ".woff", ".woff2", ".ttf", ".eot", ".pdf":
+		path, templated = r.URL.Path, false
+	}
+
+	if path == "/" || strings.HasPrefix(path, "/static") {
+		path, templated = r.URL.Path, false
+	}
+
+	return strings.TrimSuffix(path, "/"), templated
+}
+
+// histogramName is the request-duration histogram this middleware records.
+const histogramName = "app_http_response"
+
+// metricsOptRecorder is the fastest optional interface: an implementation that
+// accepts an already-built measurement option lets this middleware build each
+// (path, method, status) option once instead of on every request.
+type metricsOptRecorder interface {
+	RecordHistogramOpt(ctx context.Context, name string, value float64, opts ...metric.RecordOption)
+}
+
+// statusRouteKey identifies a (path, method, status) triple.
+type statusRouteKey struct {
+	path, method string
+	status       int
+}
+
+// histogramRecorder records one app_http_response observation.
+//
+// Three implementations exist because a metrics backend may support three
+// levels of pre-building. Choosing between them once, at construction, keeps
+// that decision out of the request path and keeps each strategy independently
+// readable and testable.
+type histogramRecorder interface {
+	// templated reports whether path is a bounded route template. Only a
+	// templated path may be used as a cache key -- see metricsPath.
+	record(path, method string, status int, seconds float64, templated bool)
+}
+
+// newHistogramRecorder selects the most capable strategy the backend supports.
+func newHistogramRecorder(m metrics) histogramRecorder {
+	statusAttr := newStatusAttrCache()
+
+	if r, ok := m.(metricsOptRecorder); ok {
+		return &optionRecorder{rec: r, statusAttr: statusAttr}
+	}
+
+	if a, ok := m.(metricsAttrer); ok {
+		return &attrsRecorder{rec: a, statusAttr: statusAttr}
+	}
+
+	return &labelsRecorder{rec: m}
+}
+
+// newStatusAttrCache returns a memoized status-attribute builder.
+//
+// The value is a string, not an Int: metricsManager's varargs path emits status
+// as a string and OTLP exporters distinguish KeyValue types, so a mismatch would
+// break user queries expecting a string across the two code paths.
+func newStatusAttrCache() func(int) attribute.KeyValue {
+	var cache sync.Map // map[int]attribute.KeyValue
+
+	return func(code int) attribute.KeyValue {
+		if v, ok := cache.Load(code); ok {
+			kv, _ := v.(attribute.KeyValue)
+
+			return kv
+		}
+
+		kv := attribute.String("status", strconv.Itoa(code))
+		cache.Store(code, kv)
+
+		return kv
+	}
+}
+
+// optionRecorder caches one fully built measurement option per
+// (path, method, status), so metric.WithAttributes -- which builds and sorts an
+// attribute.Set -- runs once per combination rather than once per request.
+type optionRecorder struct {
+	rec        metricsOptRecorder
+	statusAttr func(int) attribute.KeyValue
+	cache      routeCache[[]metric.RecordOption] // keyed on statusRouteKey
+}
+
+func (o *optionRecorder) record(path, method string, status int, seconds float64, templated bool) {
+	cacheable := templated && cacheableMethod(method)
+	key := statusRouteKey{path: path, method: method, status: status}
+
+	if cacheable {
+		if opts, ok := o.cache.load(key); ok {
+			o.rec.RecordHistogramOpt(context.Background(), histogramName, seconds, opts...)
+
+			return
+		}
+	}
+
+	// Cache the option slice, not the option: passing a lone option into the
+	// variadic would allocate a one-element slice on every request.
+	//
+	// The status attribute is a String, not an Int: metricsManager's varargs
+	// path emits status as a string and OTLP exporters distinguish KeyValue
+	// types, so the two paths must agree or a dashboard breaks depending on
+	// which recorder the backend selected.
+	opts := []metric.RecordOption{metric.WithAttributes(
+		attribute.String("path", path),
+		attribute.String("method", method),
+		o.statusAttr(status),
+	)}
+
+	if cacheable {
+		o.cache.store(key, opts)
+	}
+
+	o.rec.RecordHistogramOpt(context.Background(), histogramName, seconds, opts...)
+}
+
+// attrsRecorder caches the (path, method) attribute pair and copies it into a
+// fixed three-element array, avoiding the append-and-grow that appending status
+// to a cap=2 slice would cost.
+type attrsRecorder struct {
+	rec        metricsAttrer
+	statusAttr func(int) attribute.KeyValue
+	cache      routeCache[[]attribute.KeyValue] // keyed on routeMethodKey
+}
+
+func (a *attrsRecorder) record(path, method string, status int, seconds float64, templated bool) {
+	key := routeMethodKey{path: path, method: method}
+
+	var b []attribute.KeyValue
+
+	// This cache used to have no ceiling at all while its sibling above had one,
+	// which is exactly the inconsistency that makes a shared key space dangerous:
+	// one malicious request stream inflates whichever cache is unbounded. Both
+	// now go through routeCache under the same rules.
+	cacheable := templated && cacheableMethod(method)
+	if cacheable {
+		b, _ = a.cache.load(key)
+	}
+
+	if b == nil {
+		b = []attribute.KeyValue{
+			attribute.String("path", path),
+			attribute.String("method", method),
+		}
+
+		if cacheable {
+			a.cache.store(key, b)
+		}
+	}
+
+	attrs := [3]attribute.KeyValue{b[0], b[1], a.statusAttr(status)}
+
+	a.rec.RecordHistogramAttrs(context.Background(), histogramName, seconds, attrs[:]...)
+}
+
+// labelsRecorder is the fallback for an external metrics implementation that
+// offers neither fast-path interface.
+type labelsRecorder struct{ rec metrics }
+
+func (l *labelsRecorder) record(path, method string, status int, seconds float64, _ bool) {
+	l.rec.RecordHistogram(context.Background(), histogramName, seconds,
+		"path", path, "method", method, "status", strconv.Itoa(status))
+}

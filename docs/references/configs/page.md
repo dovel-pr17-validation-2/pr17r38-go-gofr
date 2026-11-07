@@ -1,0 +1,901 @@
+---
+description: "Reference of every GoFr configuration variable, grouped by category: HTTP, gRPC, datasources, observability, auth, and more — with defaults and value formats."
+nextjs:
+  metadata:
+    title: "GoFr Configuration Reference — Env Vars and Defaults"
+    description: "Reference of every GoFr configuration variable, grouped by category: HTTP, gRPC, datasources, observability, auth, and more — with defaults and value formats."
+---
+
+# GoFr Configuration Options
+
+This document lists all the configuration options supported by the GoFr framework. The configurations are grouped by category for better organization.
+
+## App
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  APP_NAME
+-  Name of the application. It is also the `service.name` on the resource attached to exported traces and metrics; OTEL_SERVICE_NAME and a service.name= entry in OTEL_RESOURCE_ATTRIBUTES are ignored.
+-  gofr-app
+
+---
+
+-  APP_ENV
+-  Name of the environment file to use (e.g., stage.env, prod.env, or local.env).
+
+---
+
+-  APP_VERSION
+-  Application version
+-  dev
+
+---
+
+-  LOG_LEVEL
+-  Level of verbosity for application logs. Supported values are **DEBUG, INFO, NOTICE, WARN, ERROR, FATAL**
+-  INFO
+
+---
+
+-  REMOTE_LOG_URL
+-  URL to remotely change the log level
+
+---
+
+-  REMOTE_LOG_FETCH_INTERVAL
+-  Time interval (in seconds) to check for remote log level updates
+-  15
+
+---
+
+-  METRICS_PORT
+-  Port on which the application exposes the Prometheus pull endpoint. Set to 0 to disable it (e.g. push-only serverless).
+-  2121
+
+---
+
+-  METRICS_EXPORTER
+-  Enables push-based metrics export alongside the pull endpoint. Supported values: otlp, gcp. Unset (or prometheus) keeps pull-only behavior.
+
+---
+
+-  METRICS_URL
+-  Endpoint of the OTLP metrics collector/backend. host:port for gRPC, full URL for HTTP. Required when METRICS_EXPORTER is otlp (gcp defaults to telemetry.googleapis.com:443).
+
+---
+
+-  METRICS_PROTOCOL
+-  OTLP transport for pushed metrics. Supported values: grpc, http.
+-  grpc
+
+---
+
+-  METRICS_EXPORT_INTERVAL
+-  Interval (in seconds) at which metrics are pushed to the collector/backend.
+-  30
+
+---
+
+-  METRICS_TEMPORALITY
+-  OTLP temporality preference. Supported values: cumulative, delta, lowmemory. Use delta for Datadog; cumulative for Prometheus/GMP/Grafana.
+-  cumulative
+
+---
+
+-  METRICS_HEADERS
+-  Custom headers for metric export requests in comma-separated key=value format (e.g., "dd-api-key=secret"). Takes priority over METRICS_AUTH_KEY.
+
+---
+
+-  METRICS_AUTH_KEY
+-  Authorization header value for metric export requests. Used when METRICS_HEADERS is unset.
+
+---
+
+-  METRICS_INSECURE
+-  Disables transport security for the OTLP metrics connection. Set to false for managed backends over TLS. Ignored by the gcp exporter (always TLS).
+-  true
+
+---
+
+-  METRICS_CARDINALITY_LIMIT
+-  Per-instrument attribute-set limit, inclusive of the overflow slot: an instrument keeps up to one fewer than this many distinct label sets per collection cycle, and the remaining series collapse into a single otel.metric.overflow series (so a value of n keeps n-1 real label sets). Set 0 or negative for unlimited. When unset, the OpenTelemetry SDK default applies (2000, or OTEL_GO_X_CARDINALITY_LIMIT if set); a set value takes precedence over OTEL_GO_X_CARDINALITY_LIMIT. HTTP metrics give requests that match no route (and unknown methods) at most a quarter of this limit, capped at 500 distinct (path, method, status) label sets (`METRICS_UNMATCHED_LIMIT` lowers it further); past that they are recorded as `__unmatched__` / `__other__`, so scanner traffic cannot push real routes into the overflow series.
+-  2000
+
+---
+
+-  METRICS_UNMATCHED_LIMIT
+-  Most distinct (path, method, status) label sets that HTTP metrics record verbatim, per process, for requests that match no route, including a known path called with a method it does not serve (405), and for unknown methods before recording them as `__unmatched__` / `__other__`. It only ever lowers the budget: the effective value is the smallest of this, a quarter of METRICS_CARDINALITY_LIMIT, and 500. Set 0 to collapse from the first request, which suits short-lived or autoscaled instances (Cloud Run, serverless) where each instance would otherwise add its own scanner paths at the backend. A negative or non-integer value is treated as 0 and logged as a warning. At 0, requests served by a route registered at `/` and static files are also recorded as `__unmatched__`.
+-  500
+
+---
+
+-  OTEL_RESOURCE_ATTRIBUTES
+-  Standard OpenTelemetry resource attributes, comma-separated key=value. Merged into the resource attached to every exported metric and span, except service.name, which comes from APP_NAME (a service.name= entry is ignored with a warning), and framework_version, which cannot be overridden. Required for the gcp exporter outside Google Cloud: its ingest rejects any point whose prometheus_target has no location (e.g. "location=us-central1").
+
+---
+
+-  OTEL_SERVICE_NAME
+-  Standard OpenTelemetry service name. Ignored: GoFr sets service.name on exported traces and metrics from APP_NAME, and logs a warning at startup when this is set to a different value. Tracing and metrics each log it, so with both enabled the warning appears twice, once prefixed "traces:" and once "metrics:". Set APP_NAME to rename the service.
+
+---
+
+-  HTTP_PORT
+-  Port on which the HTTP server listens
+-  8000
+
+---
+
+-  GRPC_PORT
+-  Port on which the gRPC server listens
+-  9000
+
+---
+
+-  MCP_PORT
+-  Port on which the MCP server listens, bound to loopback. Only used when `app.EnableMCP()` is called; a port that cannot be claimed fails startup. Set to `0` to keep tools available in-process while serving no MCP transport. A non-numeric or out-of-range value refuses startup. Note the default collides with Vault's — see [MCP](/docs/advanced-guide/mcp).
+-  8200
+
+---
+
+-  TRACE_EXPORTER
+-  Tracing exporter to use. Supported values: gofr, zipkin, jaeger, otlp, gcp. `gcp` exports directly to Google Cloud's Telemetry (OTLP) API using Application Default Credentials, and requires the blank import `_ "gofr.dev/pkg/gofr/traces/exporters/gcp"`.
+
+---
+
+-  TRACER_HOST
+-  Hostname of the tracing collector. Required if TRACE_EXPORTER is set to zipkin or jaeger.
+-  **DEPRECATED**
+
+---
+
+-  TRACER_PORT
+-  Port of the tracing collector. Required if TRACE_EXPORTER is set to zipkin or jaeger.
+-  9411
+-  **DEPRECATED**
+
+---
+
+-  TRACER_URL
+-  URL of the trace collector. Required if TRACE_EXPORTER is set to zipkin, jaeger or otlp; optional for gcp, which defaults to `telemetry.googleapis.com:443`. For zipkin, jaeger and otlp an `http://` or `https://` scheme selects the transport, and a schemeless `host:port` is governed by TRACER_INSECURE. For gcp the value must be a schemeless `host:port` — that destination is always TLS on 443, so a scheme is rejected at startup rather than interpreted.
+
+---
+
+-  TRACER_INSECURE
+-  Whether a schemeless TRACER_URL (`host:port`) is exported over plaintext. Set to `false` to use TLS with the system root CAs. Ignored when TRACER_URL carries an `http://` or `https://` scheme, which selects the transport itself. Takes precedence over the OTel standard OTEL_EXPORTER_OTLP_INSECURE / OTEL_EXPORTER_OTLP_TRACES_INSECURE. Supported for otlp, jaeger.
+-  true
+
+---
+
+-  TRACER_RATIO
+-  Refers to the proportion of traces that are exported through sampling. It is optional configuration. By default, this ratio is set to 1. A value that is not a valid number is rejected with an error log and also resolves to 1, so a typo over-samples rather than silently disabling tracing.
+
+---
+
+-  TRACER_AUTH_KEY
+-  Authorization header for trace exporter requests. Supported for zipkin, jaeger, otlp.
+
+---
+
+-  TRACER_HEADERS
+-  Custom authentication headers for trace exporter requests in comma-separated key=value format (e.g., "X-Api-Key=secret,Authorization=Bearer token"). Supported for zipkin, jaeger, otlp. Takes priority over TRACER_AUTH_KEY.
+
+---
+
+-  CMD_LOGS_FILE
+-  File to save the logs in case of a CMD application
+
+---
+
+-  SHUTDOWN_GRACE_PERIOD
+-  Timeout duration for server shutdown process
+-  30s
+
+---
+
+-  GOFR_TELEMETRY
+-  Enable telemetry for GoFr framework usage
+-  true
+
+---
+
+-  GOFR_ROUTER
+-  Route matcher for the HTTP server. Set to `trie` to opt into the O(path length) trie index instead of the default linear scan — see [Routing Performance](/docs/advanced-guide/routing-performance). Any other value falls back to `mux`.
+-  mux
+
+---
+
+-  GOFR_RBAC_ROUTE_CHECK
+-  What the startup check does when the RBAC config and the registered routes disagree — see [Startup Route Check](/docs/advanced-guide/rbac#startup-route-check). `warn` logs each mismatch as an error and keeps starting, `fail` logs them and stops startup with exit status 1, `off` skips the check. Any other value is logged as an error and treated as `warn`.
+-  warn
+
+---
+
+-  LOG_DISABLE_PROBES
+-  Disable log probes for health checks
+-  false
+
+---
+
+-  GRPC_ENABLE_REFLECTION
+-  Enable gRPC server reflection
+-  false
+
+---
+
+-  HEALTH_CACHE_TTL
+-  How long a health result may be served without re-checking the backends, as a duration (`5s`, `10s`, `1m`). Unset, `0` or `disabled` turns caching off, which is the default: within a TTL a recovered backend still reports DOWN and a failed one still reports UP, so it is a trade to opt into rather than inherit.
+-  disabled
+
+---
+
+-  HEALTH_CHECK_TIMEOUT
+-  Upper bound on one round of health checks, as a duration (`2s`). Backends that have not answered by then are left out of the response and the aggregate status is DEGRADED. Datasources whose health check honors its context are canceled at that deadline. Once every outstanding check has returned, the next probe checks them again. Checks that cannot be canceled keep running after the round is abandoned: the SQL, Redis and PubSub health checks take no context, and a few datasources (such as Couchbase and NATS KV) don't yet honor the one they receive. While one of those is still running, a probe reports DEGRADED with no per-dependency detail rather than starting a second round against the same unresponsive backend. Unset or `0` means the round is bounded only by each backend client's own timeout.
+-  disabled
+
+{% /table %}
+
+## HTTP
+
+{% table %}
+
+- Name
+- Description
+
+---
+
+-  REQUEST_TIMEOUT
+-  Set the request timeouts (in seconds) for HTTP server.
+
+---
+
+- CERT_FILE
+- Set the path to your PEM certificate file for the HTTPS server to establish a secure connection.
+
+--- 
+
+- KEY_FILE
+- Set the path to your PEM key file for the HTTPS server to establish a secure connection.
+
+{% /table %}
+
+### CORS
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+- ACCESS_CONTROL_ALLOW_ORIGIN
+- Allowed origin(s) for cross-origin requests. Supports comma-separated values for multiple origins (e.g., `https://app.example.com,https://admin.example.com`).
+- `*`
+
+---
+
+- ACCESS_CONTROL_ALLOW_HEADERS
+- Allowed request headers for cross-origin requests.
+- Authorization, Content-Type, x-requested-with, origin, true-client-ip, X-Correlation-ID
+
+---
+
+- ACCESS_CONTROL_ALLOW_METHODS
+- Allowed HTTP methods. Automatically set from registered routes if not provided.
+
+---
+
+- ACCESS_CONTROL_ALLOW_CREDENTIALS
+- Allow credentials (cookies, HTTP authentication) in cross-origin requests.
+
+---
+
+- ACCESS_CONTROL_EXPOSE_HEADERS
+- Additional headers exposed to the client in cross-origin responses.
+
+---
+
+- ACCESS_CONTROL_MAX_AGE
+- Maximum time (in seconds) browsers can cache preflight responses.
+
+{% /table %}
+
+## Datasource
+
+### SQL
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  DB_DIALECT
+-  Database dialect. Supported values: mysql, postgres, supabase, sqlite, cockroachdb. If unset, SQL is not initialized; GoFr logs an error at startup when DB_HOST or DB_NAME is set.
+
+---
+
+-  DB_HOST
+-  Hostname of the database server.
+
+---
+
+-  DB_PORT
+-  Port of the database server.
+-  3306
+
+---
+
+-  DB_USER
+-  Username for the database.
+
+---
+
+-  DB_PASSWORD
+-  Password for the database.
+
+---
+
+-  DB_NAME
+-  Name of the database to use.
+
+---
+
+-  DB_MAX_IDLE_CONNECTION
+-  Number of maximum idle connection.
+-  2
+
+---
+
+-  DB_MAX_OPEN_CONNECTION
+-  Number of maximum connections which can be used with database.
+-  0 (unlimited)
+---
+
+-  DB_CONNECT_TIMEOUT
+-  Timeout in whole seconds for establishing a database connection (MySQL, PostgreSQL, Supabase and CockroachDB; SQLite ignores it). When set, it bounds how long establishing a connection can take. For PostgreSQL, Supabase and CockroachDB this includes a host that accepts the connection but never answers. For MySQL it bounds only the TCP dial (an unreachable host), not a server that accepts the connection and then stalls the handshake. Unset or 0 means no timeout, as before. A negative or non-numeric value logs a warning and is ignored.
+-  0 (no timeout)
+
+---
+
+-  DB_SSL_MODE
+-  TLS/SSL mode for database connections. Supported modes: **disable** (no TLS), **preferred** (attempts TLS, falls back to plain), **require** (enforces TLS, skips validation), **skip-verify** (enforces TLS, no certificate validation), **verify-ca** (enforces TLS, validates certificate against CA), **verify-full** (enforces TLS with full validation including hostname). Currently supported for MySQL/MariaDB and PostgreSQL.
+-  disable
+
+---
+
+- DB_TLS_CA_CERT
+- Path to CA certificate file for TLS connections. Required for **verify-ca** and **verify-full** SSL modes.
+- None
+
+---
+
+- DB_TLS_CLIENT_CERT
+- Path to client certificate file for mutual TLS authentication.
+- None
+
+---
+
+- DB_TLS_CLIENT_KEY
+- Path to client private key file for mutual TLS authentication.
+- None
+
+---
+
+- DB_REPLICA_HOSTS
+- Comma-separated list of replica database hosts. Used for read replicas.
+- None
+
+---
+
+- DB_REPLICA_PORTS
+- Comma-separated list of replica database ports. Used for read replicas.
+- None
+
+---
+
+- DB_REPLICA_USERS
+- Comma-separated list of replica database users. Used for read replicas.
+- None
+
+---
+
+- DB_REPLICA_PASSWORDS
+- Comma-separated list of replica database passwords. Used for read replicas.
+- None
+
+---
+
+- DB_REPLICA_MAX_IDLE_CONNECTIONS
+- Maximum idle connections allowed for a replica
+- 50
+
+---
+
+- DB_REPLICA_MIN_IDLE_CONNECTIONS
+- Minimum idle connections for a replica
+- 10
+
+---
+
+- DB_REPLICA_DEFAULT_IDLE_CONNECTIONS
+- Idle connections used if no primary setting is provided
+- 10
+
+---
+
+- DB_REPLICA_MAX_OPEN_CONNECTIONS
+- Maximum open connections allowed for a replica
+- 200
+
+---
+
+- DB_REPLICA_MIN_OPEN_CONNECTIONS
+- Minimum open connections for a replica
+- 50
+
+---
+
+- DB_REPLICA_DEFAULT_OPEN_CONNECTIONS
+- Open connections used if no primary setting is provided
+- 100
+
+---
+
+
+- DB_CHARSET
+- The character set for database connection
+- utf8
+
+---
+
+- DB_REDACT_ARGS
+- Set to `true` to hide query arguments: each value in the debug query log becomes `*****`, so only the count stays visible. Covers queries on the DB and inside transactions, for the SQL datasource GoFr creates from config (not a connection passed to `NewSQLFromDB`).
+- false
+
+---
+
+- SUPABASE_CONNECTION_TYPE 
+- Connection type to Supabase. Supported values: direct, session, transaction 
+- direct
+
+---
+
+- SUPABASE_PROJECT_REF 
+- Supabase project reference ID
+
+---
+
+- SUPABASE_REGION 
+- Supabase region for pooled connections
+
+---
+
+- DB_URL 
+- Full PostgreSQL connection string for Supabase (alternative to separate config parameters)
+
+{% /table %}
+
+### Redis
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  REDIS_HOST
+-  Hostname of the Redis server.
+-  localhost
+
+---
+
+-  REDIS_PORT
+-  Port of the Redis server.
+-  6379
+
+---
+
+- REDIS_USER
+- Username for the Redis server (optional).
+-  ""
+
+---
+
+- REDIS_PASSWORD
+- Password for the Redis server (optional).
+-  ""
+
+---
+
+- REDIS_DB
+- Database number to use for the Redis server.
+-  0
+
+---
+
+- REDIS_REDACT_ARGS
+- Set to `true` to hide command arguments (keys and values): each one becomes `*****` in the debug query log, and trace spans drop the `db.statement` attribute but are still named after the command. Redis pub/sub message bodies are masked in the debug log too.
+-  false
+
+---
+
+- REDIS_TLS_ENABLED
+- Enable TLS for Redis connections.
+-  false
+
+---
+
+- REDIS_TLS_CA_CERT
+- Path to the TLS CA certificate file for Redis (or PEM-encoded string).
+-  ""
+
+---
+
+- REDIS_TLS_CERT
+- Path to the TLS certificate file for Redis (or PEM-encoded string).
+-  ""
+
+---
+
+- REDIS_TLS_KEY
+- Path to the TLS key file for Redis (or PEM-encoded string).
+-  ""
+
+---
+
+- REDIS_URL
+- Connection URL for Redis, such as `rediss://user:password@host:6380/2`. Only the `redis://` and `rediss://` schemes are accepted, and `rediss://` turns TLS on. When set, it alone decides the host, port, user, password, DB and TLS: `REDIS_HOST`, `REDIS_PORT`, `REDIS_USER`, `REDIS_PASSWORD`, `REDIS_DB` and `REDIS_TLS_ENABLED` are ignored, with a warning that names them. An invalid URL, including one with no host, logs an error and Redis is not connected. Percent-encode a user name or password that contains `@`, `/`, `:` or `%` (`p@ss` becomes `p%40ss`). `REDIS_TLS_CA_CERT`, `REDIS_TLS_CERT` and `REDIS_TLS_KEY` still apply to a `rediss://` URL.
+-  ""
+
+---
+
+- REDIS_POOL_SIZE
+- Maximum number of connections in the Redis pool. Overrides a `pool_size` parameter in `REDIS_URL`.
+-  10 per CPU
+
+---
+
+- REDIS_MIN_IDLE_CONNS
+- Minimum number of idle connections kept in the Redis pool. Overrides a `min_idle_conns` parameter in `REDIS_URL`.
+-  0
+
+---
+
+- REDIS_DIAL_TIMEOUT
+- Timeout for opening a new Redis connection, as a duration (`500ms`). Overrides a `dial_timeout` parameter in `REDIS_URL`.
+-  5s
+
+---
+
+- REDIS_READ_TIMEOUT
+- Timeout for reading a Redis reply, as a duration (`500ms`). Overrides a `read_timeout` parameter in `REDIS_URL`.
+-  5s
+
+---
+
+- REDIS_WRITE_TIMEOUT
+- Timeout for writing a Redis command, as a duration (`500ms`). Overrides a `write_timeout` parameter in `REDIS_URL`.
+-  Same as `REDIS_READ_TIMEOUT`
+
+{% /table %}
+
+> **Note**: An invalid value for `REDIS_POOL_SIZE`, `REDIS_MIN_IDLE_CONNS` or one of the `REDIS_*_TIMEOUT` variables logs a warning and is ignored, so the `REDIS_URL` parameter or the default still applies. `REDIS_POOL_SIZE` and the timeouts must be greater than zero; `REDIS_MIN_IDLE_CONNS` can be `0`.
+
+**Redis PubSub Configuration:**
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+- REDIS_PUBSUB_DB
+- Redis database number to use only for Redis Pub/Sub (when `PUBSUB_BACKEND=REDIS`). Use a different DB than `REDIS_DB` when running GoFr migrations with Redis Streams mode to avoid `gofr_migrations` key-type collisions.
+- Default: `15` (highest default Redis database, 0-15)
+
+---
+
+- REDIS_PUBSUB_MODE
+- Operation mode: `pubsub` or `streams`.
+- streams
+
+---
+
+- REDIS_STREAMS_CONSUMER_GROUP
+- Consumer group name (required for streams mode).
+-  ""
+
+---
+
+- REDIS_STREAMS_CONSUMER_NAME
+- Unique consumer name (optional, auto-generated if empty).
+-  ""
+
+---
+
+- REDIS_STREAMS_BLOCK_TIMEOUT
+- Blocking duration for reading new messages using Redis `XREADGROUP`. Lower values (1s-2s) provide faster detection but increase CPU usage. Higher values (10s-30s) reduce CPU usage, ideal for batch processing.
+- 5s
+
+---
+
+- REDIS_STREAMS_PEL_RATIO
+- Ratio of PEL (pending) messages to read vs new messages (0.0-1.0). Controls balance between retry and fresh messages. 0.7 = 70% PEL, 30% new.
+- 0.7
+
+---
+
+- REDIS_STREAMS_MAXLEN
+- Maximum length of the stream (approximate). Prevents streams from growing indefinitely. Set to `0` for unlimited.
+- 0 (unlimited)
+
+{% /table %}
+
+> **Note**: When using GoFr migrations with Streams mode, keep `REDIS_DB` and `REDIS_PUBSUB_DB` separate (defaults: 0 and 15). For `REDIS_STREAMS_BLOCK_TIMEOUT`: use 1s-2s for real-time or 10s-30s for batch processing.
+
+### Pub/Sub
+
+{% table %}
+
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  PUBSUB_BACKEND
+-  Pub/Sub message broker backend wired automatically by `gofr.New()`. Accepted values: `kafka`, `google`, `mqtt`, `redis` (case-insensitive). Other backends (NATS JetStream, AWS SQS, Azure Event Hub) are wired explicitly via `app.AddPubSub(...)`.
+-  
+
+{% /table %}
+
+**Kafka**
+
+{% table %}
+
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  PUBSUB_BROKER
+-  Comma-separated list of broker addresses
+-  localhost:9092
+
+---
+
+-  PARTITION_SIZE
+-  Size of each message partition (in bytes)
+-  0
+
+---
+
+-  PUBSUB_OFFSET
+-  Offset to start consuming messages from. -1 for earliest, 0 for latest.
+-  -1
+
+---
+
+- KAFKA_BATCH_SIZE
+- Number of messages to batch before sending to Kafka
+- 1
+
+---
+
+- KAFKA_BATCH_BYTES
+- Number of bytes to batch before sending to Kafka
+- 1048576
+
+---
+
+- KAFKA_BATCH_TIMEOUT
+- Time to wait before sending a batch to Kafka
+- 100ms
+
+---
+
+-  CONSUMER_ID
+-  Unique identifier for this consumer
+-  gofr-consumer
+
+---
+
+---
+
+- KAFKA_SECURITY_PROTOCOL
+- Security protocol used to communicate with Kafka (e.g., PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL)
+- PLAINTEXT
+
+---
+
+
+- KAFKA_SASL_MECHANISM
+- SASL mechanism for authentication (e.g. PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+- None
+
+---
+
+- KAFKA_SASL_USERNAME
+- Username for SASL authentication
+- None
+
+---
+
+- KAFKA_SASL_PASSWORD
+- Password for SASL authentication
+- None
+
+---
+
+- KAFKA_TLS_CERT_FILE
+- Path to the TLS certificate file
+- None
+
+---
+
+- KAFKA_TLS_KEY_FILE
+- Path to the TLS key file
+- None
+
+---
+
+- KAFKA_TLS_CA_CERT_FILE
+- Path to the TLS CA certificate file
+- None
+
+---
+
+- KAFKA_TLS_INSECURE_SKIP_VERIFY
+- Skip TLS certificate verification
+- false
+
+{% /table %}
+
+**Google**
+
+{% table %}
+
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  GOOGLE_PROJECT_ID
+-  ID of the Google Cloud project. Required for Google Pub/Sub.
+-  None
+
+---
+
+-  GOOGLE_SUBSCRIPTION_NAME
+-  Name of the Google Pub/Sub subscription. Required for Google Pub/Sub.
+-  None
+
+---
+
+-  GOOGLE_MAX_OUTSTANDING_MESSAGES
+-  Max messages the client holds waiting for delivery to the handler, per subscribed topic (the memory/goroutine bound, not the handler concurrency). 0 uses the default; a negative value means no limit.
+-  1000
+
+---
+
+-  GOOGLE_MAX_OUTSTANDING_BYTES
+-  Max total size (bytes) of messages held waiting for delivery, per subscribed topic. 0 uses the default; a negative value means no limit.
+-  1000000000
+
+---
+
+-  GOOGLE_NUM_GOROUTINES
+-  Number of StreamingPull streams opened by the subscriber, per subscribed topic. It is the stream count, not handler concurrency, and does not raise throughput under GoFr's one-message-at-a-time delivery. 0 or a negative value uses the default.
+-  10
+
+{% /table %}
+
+**MQTT**
+
+{% table %}
+
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  MQTT_PORT
+-  Port of the MQTT broker
+-  1883
+
+---
+
+-  MQTT_MESSAGE_ORDER
+-  Enable guaranteed message order
+-  false
+
+---
+
+-  MQTT_PROTOCOL
+-  Communication protocol. Supported values: tcp, ssl.
+-  tcp
+
+---
+
+-  MQTT_HOST
+-  Hostname of the MQTT broker
+-  localhost
+
+---
+
+-  MQTT_USER
+-  Username for the MQTT broker
+
+---
+
+-  MQTT_PASSWORD
+-  Password for the MQTT broker
+
+---
+
+-  MQTT_CLIENT_ID_SUFFIX
+-  Suffix appended to the client ID
+
+---
+
+-  MQTT_QOS
+-  Quality of Service Level
+
+---
+
+-  MQTT_KEEP_ALIVE
+-  Sends regular messages to check the link is active. May not work as expected if handling func is blocking execution
+
+- MQTT_RETRIEVE_RETAINED
+- Retrieve retained messages on subscription
+
+{% /table %}
+
+**NATS JetStream**
+
+{% table %}
+
+- Name
+- Description
+- Default Value
+
+---
+
+-  NATS_SERVER
+-  URL of the NATS server. The NATS driver is wired explicitly via `app.AddPubSub(...)`; this row is a convention only — the actual env-var name is whatever you read from `app.Config.Get(...)` and pass into `nats.Config.Server`.
+-  nats://localhost:4222
+
+---
+
+-  NATS_CREDS_FILE
+-  File containing the NATS credentials
+- creds.json
+
+{% /table %}
+
+
+
+## Related production guides
+
+- **12-Factor Configuration**: [Env-driven config, secrets, and environment parity](/docs/guides/twelve-factor-config) — apply 12-factor methodology to the configs documented above.

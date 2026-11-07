@@ -1,0 +1,553 @@
+package rbac
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"go.opentelemetry.io/otel/trace"
+	"gopkg.in/yaml.v3"
+
+	"gofr.dev/pkg/gofr/container"
+	"gofr.dev/pkg/gofr/datasource"
+)
+
+var (
+	// errUnsupportedFormat is returned when the config file format is not supported.
+	errUnsupportedFormat = errors.New("unsupported config file format")
+
+	// ErrEndpointMissingPermissions is returned when an endpoint doesn't specify requiredPermissions and is not public.
+	ErrEndpointMissingPermissions = errors.New("endpoint must specify requiredPermissions (or be public)")
+
+	// errWildcardPatternNotSupported is returned when a wildcard pattern is used.
+	errWildcardPatternNotSupported = errors.New("wildcard pattern '/*' is not supported, use mux patterns instead")
+
+	// errRegexPatternNotSupported is returned when an old regex pattern is used.
+	errRegexPatternNotSupported = errors.New("regex pattern '^...$' is not supported, use mux patterns instead")
+
+	// errRegexIndicatorNotSupported is returned when regex indicators are used outside variable constraints.
+	errRegexIndicatorNotSupported = errors.New("regex pattern is not supported, use mux patterns instead")
+
+	// errBothClaimPaths is returned when both jwtClaimPath and permissionsClaimPath are set.
+	errBothClaimPaths = errors.New("jwtClaimPath and permissionsClaimPath cannot both be set")
+
+	// errInvalidPermissionsClaimPath is returned when permissionsClaimPath cannot be parsed, which would
+	// otherwise deny every request without a word.
+	errInvalidPermissionsClaimPath = errors.New("permissionsClaimPath cannot be parsed")
+)
+
+// extractionFailuresMetric counts requests whose role or permissions could not be read. App.EnableRBAC
+// registers it, once per app.
+const extractionFailuresMetric = "rbac_role_extraction_failures"
+
+// Modes reported in the startup line, naming where authorization reads from.
+const (
+	modePermissions = "permissions"
+	modeRoles       = "roles"
+	modeHeader      = "header"
+	modeNone        = "none"
+)
+
+// RoleDefinition defines a role with its permissions and inheritance.
+// Pure config-based: only role->permission mapping is supported.
+type RoleDefinition struct {
+	// Name is the role name (required)
+	Name string `json:"name" yaml:"name"`
+
+	// Permissions is a list of permissions for this role (format: "resource:action")
+	// Example: ["users:read", "users:write"]
+	Permissions []string `json:"permissions,omitempty" yaml:"permissions,omitempty"`
+
+	// InheritsFrom lists roles this role inherits permissions from
+	// Example: ["viewer"] - editor inherits all viewer permissions
+	InheritsFrom []string `json:"inheritsFrom,omitempty" yaml:"inheritsFrom,omitempty"`
+}
+
+// EndpointMapping defines authorization requirements for an API endpoint.
+// Pure config-based: only route&method->permission mapping is supported.
+// No direct route to role mapping - all authorization is permission-based.
+type EndpointMapping struct {
+	// Path is the route path pattern using gorilla/mux syntax.
+	// Examples:
+	//   - "/api/users" (exact match)
+	//   - "/api/users/{id}" (matches any single segment)
+	//   - "/api/users/{id:[0-9]+}" (matches numeric IDs only)
+	//   - "/api/{resource}" (single-level wildcard: matches /api/users, /api/posts)
+	//   - "/api/{path:.*}" (multi-level wildcard: matches /api/users/123, /api/posts/comments)
+	//   - "/api/{category}/posts" (middle variable: matches /api/tech/posts, /api/news/posts)
+	// Only mux-style patterns are supported. Wildcards (/*) and regex (^...$) are not supported.
+	Path string `json:"path,omitempty" yaml:"path,omitempty"`
+
+	// Methods is a list of HTTP methods (GET, POST, PUT, DELETE, PATCH, etc.)
+	// Use ["*"] to match all methods
+	// Example: ["GET", "POST"]
+	Methods []string `json:"methods" yaml:"methods"`
+
+	// RequiredPermissions is a list of permissions required to access this endpoint (format: "resource:action")
+	// User needs to have ANY of these permissions (OR logic)
+	// Example: ["users:read"] or ["users:read", "users:admin"]
+	// This is checked against the role's permissions
+	// REQUIRED: All endpoints must specify requiredPermissions (except public endpoints)
+	RequiredPermissions []string `json:"requiredPermissions,omitempty" yaml:"requiredPermissions,omitempty"`
+
+	// Public indicates this endpoint is publicly accessible (bypasses authorization)
+	// Example: true for /health, /metrics endpoints
+	Public bool `json:"public,omitempty" yaml:"public,omitempty"`
+}
+
+// Config represents the unified RBAC configuration structure.
+type Config struct {
+	// Roles defines all roles with their permissions and inheritance
+	// This is the unified way to define roles (replaces RouteWithPermissions, RoleHierarchy)
+	Roles []RoleDefinition `json:"roles,omitempty" yaml:"roles,omitempty"`
+
+	// Endpoints maps API endpoints to authorization requirements
+	// This is the unified way to define endpoint access (replaces RouteWithPermissions, OverRides)
+	Endpoints []EndpointMapping `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+
+	// RoleHeader specifies the HTTP header key for header-based role extraction
+	// Example: "X-User-Role"
+	// If set, role is extracted from this header
+	RoleHeader string `json:"roleHeader,omitempty" yaml:"roleHeader,omitempty"`
+
+	// JWTClaimPath specifies the JWT claim path for JWT-based role extraction
+	// Examples: "role", "roles", "roles[0]", "permissions.role"
+	// If set, role is extracted from JWT claims in request context. A string claim is one role; an
+	// array claim holds every role in it.
+	JWTClaimPath string `json:"jwtClaimPath,omitempty" yaml:"jwtClaimPath,omitempty"`
+
+	// PermissionsClaimPath specifies the JWT claim that holds the permissions themselves.
+	// Example: "scope" for {"scope": "orders:read orders:write"}
+	// If set, Roles are not consulted: a string claim is split on spaces, an array claim is held entry
+	// by entry. Cannot be combined with JWTClaimPath. RBAC does not validate the token: set the audience
+	// and expiry checks on EnableOAuth with jwt.WithAudience and jwt.WithExpirationRequired.
+	PermissionsClaimPath string `json:"permissionsClaimPath,omitempty" yaml:"permissionsClaimPath,omitempty"`
+
+	// ErrorHandler is called when authorization fails
+	// If nil, default error response is sent
+	ErrorHandler func(w http.ResponseWriter, r *http.Request, role, route string, err error)
+
+	// Logger is the logger instance for audit logging
+	// Set automatically by EnableRBAC - users don't need to configure this
+	// Audit logging is automatically performed when RBAC is enabled
+	Logger datasource.Logger `json:"-" yaml:"-"`
+
+	// Metrics is the metrics instance for RBAC metrics
+	// Set automatically by EnableRBAC
+	Metrics container.Metrics `json:"-" yaml:"-"`
+
+	// Tracer is the tracer instance for RBAC tracing
+	// Set automatically by EnableRBAC
+	Tracer trace.Tracer `json:"-" yaml:"-"`
+
+	// Internal maps built from unified config (not in JSON/YAML)
+	// These are populated by processUnifiedConfig()
+	rolePermissionsMap    map[string][]string            `json:"-" yaml:"-"`
+	rolePermissionSet     map[string]map[string]struct{} `json:"-" yaml:"-"` // Key: role, Value: set of its permissions
+	endpointPermissionMap map[string][]string            `json:"-" yaml:"-"` // Key: "METHOD:/path", Value: []permissions
+	publicEndpointsMap    map[string]bool                `json:"-" yaml:"-"` // Key: "METHOD:/path", Value: true if public
+	endpointMap           map[string]*EndpointMapping    `json:"-" yaml:"-"` // Key: "METHOD:/path", Value: endpoint object
+
+	// rules holds every (method, path) rule ordered most-specific-first, and is the
+	// single source of truth for resolving a request that no exact key matches.
+	rules []endpointRule `json:"-" yaml:"-"`
+}
+
+// LoadPermissions loads RBAC configuration from a JSON or YAML file.
+// The file format is automatically detected based on the file extension.
+// Supported formats: .json, .yaml, .yml.
+// Dependencies (logger, metrics, tracer) are optional and can be set after loading.
+// It does not register the rbac_role_extraction_failures counter that Middleware increments;
+// App.EnableRBAC does. A caller that uses LoadPermissions and Middleware directly with metrics must
+// register that counter itself, or each failed extraction logs an error and is not counted.
+func LoadPermissions(path string, logger datasource.Logger, metrics container.Metrics, tracer trace.Tracer) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read RBAC config file %s: %w", path, err)
+	}
+
+	var config Config
+
+	// Detect file format by extension
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			return nil, fmt.Errorf("failed to parse YAML config file %s: %w", path, err)
+		}
+	case ".json", "":
+		if err := json.Unmarshal(data, &config); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON config file %s: %w", path, err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported config file format: %s (supported: .json, .yaml, .yml): %w", ext, errUnsupportedFormat)
+	}
+
+	// Set dependencies
+	config.Logger = logger
+	config.Metrics = metrics
+	config.Tracer = tracer
+
+	// Validate config before processing
+	if err := config.validate(); err != nil {
+		return nil, fmt.Errorf("invalid RBAC config: %w", err)
+	}
+
+	// Process unified config to build internal maps
+	if err := config.processUnifiedConfig(); err != nil {
+		return nil, fmt.Errorf("failed to process unified config: %w", err)
+	}
+
+	if logger != nil {
+		config.logStartup(logger)
+	}
+
+	return &config, nil
+}
+
+// logStartup logs the mode RBAC runs in, and warns about a roles section permissions mode never reads.
+func (c *Config) logStartup(logger datasource.Logger) {
+	mode, source := c.mode()
+	logger.Infof("RBAC enabled: mode=%s, source=%s", mode, source)
+
+	if mode == modePermissions && len(c.Roles) > 0 {
+		logger.Warnf("RBAC: permissionsClaimPath is set, so the roles section is ignored; " +
+			"permissions are read from the token, not from roles")
+	}
+
+	if mode == modePermissions && c.RoleHeader != "" {
+		logger.Warnf("RBAC: permissionsClaimPath is set, so roleHeader is ignored")
+	}
+}
+
+// mode reports which source authorization reads from, and the claim path or header that names it.
+func (c *Config) mode() (mode, source string) {
+	switch {
+	case c.PermissionsClaimPath != "":
+		return modePermissions, c.PermissionsClaimPath
+	case c.JWTClaimPath != "":
+		return modeRoles, c.JWTClaimPath
+	case c.RoleHeader != "":
+		return modeHeader, c.RoleHeader
+	default:
+		return modeNone, ""
+	}
+}
+
+// validate validates the RBAC configuration.
+func (c *Config) validate() error {
+	if err := c.validateClaimModes(); err != nil {
+		return err
+	}
+
+	// Validate endpoints: non-public endpoints must have RequiredPermissions
+	// Also validate that paths use mux patterns only (no wildcards or old regex)
+	for i, endpoint := range c.Endpoints {
+		if !endpoint.Public && len(endpoint.RequiredPermissions) == 0 {
+			return fmt.Errorf("endpoint[%d]: %w: %s", i, ErrEndpointMissingPermissions, endpoint.Path)
+		}
+
+		// Validate path pattern
+		if err := c.validateEndpointPath(endpoint.Path, i); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateClaimModes rejects claim settings that would otherwise be ambiguous or silently ignored.
+func (c *Config) validateClaimModes() error {
+	if c.JWTClaimPath != "" && c.PermissionsClaimPath != "" {
+		return errBothClaimPaths
+	}
+
+	// Only permissionsClaimPath is checked: a jwtClaimPath that cannot be parsed has always loaded, and
+	// rejecting it now would stop an existing service from starting.
+	if err := validateClaimPath(c.PermissionsClaimPath); err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPermissionsClaimPath, err)
+	}
+
+	return nil
+}
+
+// validateEndpointPath validates that an endpoint path uses mux patterns only.
+// Rejects wildcard patterns (/*) and old regex patterns (^...$).
+func (c *Config) validateEndpointPath(path string, index int) error {
+	if path == "" {
+		return nil // Empty path is handled elsewhere
+	}
+
+	// Reject wildcard patterns
+	if err := c.checkWildcardPattern(path, index); err != nil {
+		return err
+	}
+
+	// Reject old regex patterns
+	if err := c.checkRegexPattern(path, index); err != nil {
+		return err
+	}
+
+	// Reject regex indicators outside of variable constraints
+	if err := c.checkRegexIndicators(path, index); err != nil {
+		return err
+	}
+
+	// Validate mux pattern syntax if it contains variables
+	if isMuxPattern(path) {
+		if err := validateMuxPattern(path); err != nil {
+			return fmt.Errorf("endpoint[%d]: invalid mux pattern: %w", index, err)
+		}
+
+		// Non-fatal: a pattern mux cannot compile loads, but never matches, so say so loudly.
+		c.logUncompilablePattern(path, index)
+	}
+
+	return nil
+}
+
+// checkWildcardPattern checks if path contains wildcard pattern.
+func (*Config) checkWildcardPattern(path string, index int) error {
+	if strings.Contains(path, "/*") {
+		return fmt.Errorf("endpoint[%d]: %w: %s. Examples: /api/{resource} for single-level or /api/{path:.*} for multi-level",
+			index, errWildcardPatternNotSupported, path)
+	}
+
+	return nil
+}
+
+// checkRegexPattern checks if path contains old regex pattern.
+func (*Config) checkRegexPattern(path string, index int) error {
+	if strings.HasPrefix(path, "^") || strings.HasSuffix(path, "$") {
+		return fmt.Errorf("endpoint[%d]: %w: %s. Example: /api/users/{id:[0-9]+} instead of ^/api/users/\\d+$",
+			index, errRegexPatternNotSupported, path)
+	}
+
+	return nil
+}
+
+// checkRegexIndicators checks if path contains regex indicators outside variable constraints.
+func (*Config) checkRegexIndicators(path string, index int) error {
+	if strings.Contains(path, "\\d") || strings.Contains(path, "\\w") || strings.Contains(path, "\\s") {
+		// Only allow if it's inside a variable constraint like {id:[0-9]+}
+		if !strings.Contains(path, "{") || !strings.Contains(path, ":") {
+			return fmt.Errorf("endpoint[%d]: %w: %s. Example: /api/users/{id:[0-9]+}",
+				index, errRegexIndicatorNotSupported, path)
+		}
+	}
+
+	return nil
+}
+
+// processUnifiedConfig processes the unified Roles and Endpoints config
+// and builds internal maps for efficient lookup.
+// Config is read-only after initialization, so no mutex is needed.
+func (c *Config) processUnifiedConfig() error {
+	c.initializeMaps()
+	c.buildRolePermissionsMap()
+
+	return c.buildEndpointPermissionMap()
+}
+
+// initializeMaps initializes internal maps.
+func (c *Config) initializeMaps() {
+	c.rolePermissionsMap = make(map[string][]string)
+	c.rolePermissionSet = make(map[string]map[string]struct{})
+	c.endpointPermissionMap = make(map[string][]string)
+	c.publicEndpointsMap = make(map[string]bool)
+	c.endpointMap = make(map[string]*EndpointMapping)
+}
+
+// buildRolePermissionsMap builds the role permissions map from Roles.
+// Uses getEffectivePermissions() for consistent inheritance logic.
+func (c *Config) buildRolePermissionsMap() {
+	for _, roleDef := range c.Roles {
+		// Use getEffectivePermissions() for consistent inheritance handling
+		permissions := c.getEffectivePermissions(roleDef.Name)
+		c.rolePermissionsMap[roleDef.Name] = permissions
+
+		set := make(map[string]struct{}, len(permissions))
+		for _, p := range permissions {
+			set[p] = struct{}{}
+		}
+
+		c.rolePermissionSet[roleDef.Name] = set
+	}
+
+	c.logUnknownInheritedRoles()
+}
+
+// logUnknownInheritedRoles logs each inheritsFrom name that matches no defined role, once per role. Such a
+// role still loads with its own permissions, so without this log a misspelled parent silently grants less.
+func (c *Config) logUnknownInheritedRoles() {
+	if c.Logger == nil {
+		return
+	}
+
+	checked := make(map[string]bool, len(c.Roles))
+
+	for _, roleDef := range c.Roles {
+		// getEffectivePermissions reads only the first definition of a name, so a repeated one is skipped.
+		if checked[roleDef.Name] {
+			continue
+		}
+
+		checked[roleDef.Name] = true
+
+		logged := make(map[string]bool)
+
+		for _, inheritedName := range roleDef.InheritsFrom {
+			if _, ok := c.rolePermissionsMap[inheritedName]; ok || logged[inheritedName] {
+				continue
+			}
+
+			logged[inheritedName] = true
+
+			c.Logger.Errorf("RBAC: role %q inherits from unknown role %q; no permissions are inherited from it",
+				roleDef.Name, inheritedName)
+		}
+	}
+}
+
+// buildEndpointPermissionMap builds the endpoint permission map and the ordered rule list
+// from Endpoints.
+func (c *Config) buildEndpointPermissionMap() error {
+	for i := range c.Endpoints {
+		endpoint := &c.Endpoints[i]
+
+		methods := endpoint.Methods
+		if len(methods) == 0 {
+			methods = []string{"*"}
+		}
+
+		if err := c.processEndpointMethods(endpoint, methods); err != nil {
+			return err
+		}
+	}
+
+	c.rules = buildEndpointRules(c.Endpoints)
+
+	return nil
+}
+
+// processEndpointMethods processes methods for an endpoint.
+func (c *Config) processEndpointMethods(endpoint *EndpointMapping, methods []string) error {
+	for _, method := range methods {
+		methodUpper := strings.ToUpper(method)
+		key := buildEndpointKey(endpoint, methodUpper)
+
+		if err := c.storeEndpointMapping(endpoint, key, methodUpper); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// buildEndpointKey builds the key for an endpoint.
+// Uses Path field which may contain mux patterns or exact paths.
+func buildEndpointKey(endpoint *EndpointMapping, methodUpper string) string {
+	pattern := endpoint.Path
+	return fmt.Sprintf("%s:%s", methodUpper, pattern)
+}
+
+// storeEndpointMapping stores an endpoint mapping. A duplicate (method, path) declaration
+// overwrites the earlier one entirely - including the public flag and the permission list, which
+// live in separate maps. Leaving either behind would mix the two declarations together: a public
+// entry followed by a protected one for the same key would keep serving the route unauthenticated
+// while reporting the protected endpoint.
+func (c *Config) storeEndpointMapping(endpoint *EndpointMapping, key, methodUpper string) error {
+	// Store endpoint object for fast lookup
+	c.endpointMap[key] = endpoint
+
+	if endpoint.Public {
+		c.publicEndpointsMap[key] = true
+		delete(c.endpointPermissionMap, key)
+
+		return nil
+	}
+
+	delete(c.publicEndpointsMap, key)
+
+	if len(endpoint.RequiredPermissions) == 0 {
+		return fmt.Errorf("%w: %s %s", ErrEndpointMissingPermissions, methodUpper, endpoint.Path)
+	}
+
+	// Store all required permissions (not just the first one)
+	permissions := make([]string, len(endpoint.RequiredPermissions))
+	copy(permissions, endpoint.RequiredPermissions)
+	c.endpointPermissionMap[key] = permissions
+
+	return nil
+}
+
+// getEffectivePermissions recursively gets all permissions for a role including inherited ones.
+func (c *Config) getEffectivePermissions(roleName string) []string {
+	var permissions []string
+
+	visited := make(map[string]bool)
+
+	var collectPermissions func(string)
+
+	collectPermissions = func(name string) {
+		if visited[name] {
+			return
+		}
+
+		visited[name] = true
+
+		// Find role definition
+		for _, roleDef := range c.Roles {
+			if roleDef.Name == name {
+				permissions = append(permissions, roleDef.Permissions...)
+				// Recursively collect from inherited roles
+				for _, inheritedName := range roleDef.InheritsFrom {
+					collectPermissions(inheritedName)
+				}
+
+				break
+			}
+		}
+	}
+
+	collectPermissions(roleName)
+
+	return permissions
+}
+
+// GetRolePermissions returns the permissions for a role.
+// Config is read-only after initialization, so no mutex is needed.
+func (c *Config) GetRolePermissions(role string) []string {
+	return c.rolePermissionsMap[role]
+}
+
+// GetEndpointPermission returns the required permissions for an endpoint.
+// Returns empty slice if endpoint is public or not found.
+// Returns all required permissions (user needs ANY of them - OR logic).
+// Config is read-only after initialization, so no mutex is needed.
+func (c *Config) GetEndpointPermission(method, path string) ([]string, bool) {
+	endpoint, isPublic := c.resolve(strings.ToUpper(method), path)
+	if endpoint == nil || isPublic {
+		return nil, isPublic
+	}
+
+	permissions := make([]string, len(endpoint.RequiredPermissions))
+	copy(permissions, endpoint.RequiredPermissions)
+
+	return permissions, false
+}
+
+// getExactEndpoint returns the endpoint for an exact key match (O(1) lookup).
+// Config is read-only after initialization, so no mutex is needed.
+func (c *Config) getExactEndpoint(key string) (*EndpointMapping, bool) {
+	if endpoint, ok := c.endpointMap[key]; ok {
+		isPublic := c.publicEndpointsMap[key]
+		return endpoint, isPublic
+	}
+
+	return nil, false
+}

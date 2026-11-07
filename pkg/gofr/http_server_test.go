@@ -1,0 +1,713 @@
+package gofr
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/mock/gomock"
+
+	"gofr.dev/pkg/gofr/config"
+	"gofr.dev/pkg/gofr/container"
+	gofrHTTP "gofr.dev/pkg/gofr/http"
+	"gofr.dev/pkg/gofr/http/middleware"
+	"gofr.dev/pkg/gofr/internal/routemark"
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/testutil"
+	"gofr.dev/pkg/gofr/websocket"
+)
+
+func TestRun_ServerStartsListening(t *testing.T) {
+	port := testutil.GetFreePort(t)
+
+	// Create a mock router and add a new route
+	router := &gofrHTTP.Router{}
+	router.Add(http.MethodGet, "/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// adding registered routes for applying middlewares
+	var registeredMethods []string
+
+	_ = router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
+		met, _ := route.GetMethods()
+		for _, method := range met {
+			if !contains(registeredMethods, method) { // Check for uniqueness before adding
+				registeredMethods = append(registeredMethods, method)
+			}
+		}
+
+		return nil
+	})
+
+	router.RegisteredRoutes = &registeredMethods
+
+	// Create a mock container
+	c := container.NewContainer(getConfigs(t))
+
+	// Create an instance of httpServer
+	server := &httpServer{
+		router: router,
+		port:   port,
+	}
+
+	// Start the server
+	go server.run(c)
+
+	// Wait for the server to start listening
+	time.Sleep(100 * time.Millisecond)
+
+	var netClient = &http.Client{
+		Timeout: 200 * time.Millisecond,
+	}
+
+	// Send a GET request to the server
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		fmt.Sprintf("http://localhost:%d", port), http.NoBody)
+	resp, err := netClient.Do(req)
+
+	require.NoError(t, err, "TEST Failed.\n")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "TEST Failed.\n")
+
+	resp.Body.Close()
+}
+
+func getConfigs(t *testing.T) config.Config {
+	t.Helper()
+
+	var configLocation string
+
+	if _, err := os.Stat("./configs"); err == nil {
+		configLocation = "./configs"
+	}
+
+	return config.NewEnvFile(configLocation, logging.NewLogger(logging.INFO))
+}
+
+func TestShutdown_ServerStopsListening(t *testing.T) {
+	// Create a mock router and add a new route
+	router := &gofrHTTP.Router{}
+	router.Add(http.MethodGet, "/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Create a mock container
+	c := &container.Container{
+		Logger: logging.NewLogger(logging.INFO),
+	}
+
+	// Create an instance of httpServer
+	server := &httpServer{
+		router: router,
+		port:   8080,
+	}
+
+	// Start the server
+	go server.run(c)
+
+	// Create a context with a timeout to test the shutdown
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+
+	errChan := make(chan error, 1)
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+
+		errChan <- server.Shutdown(ctx)
+	}()
+
+	err := <-errChan
+
+	require.NoError(t, err, "TEST Failed.\n")
+}
+
+func TestShutdown_ServerContextDeadline(t *testing.T) {
+	// Create a mock router and add a new route
+	router := &gofrHTTP.Router{}
+	router.Add(http.MethodGet, "/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Create a mock container
+	c := &container.Container{
+		Logger: logging.NewLogger(logging.INFO),
+	}
+
+	// Create an instance of httpServer
+	server := &httpServer{
+		router: router,
+		port:   8080,
+	}
+
+	// Start the server
+	go server.run(c)
+
+	// Create a context with a timeout to test the shutdown
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	// Simulate a delay in the shutdown process to trigger context timeout
+	shutdownCh := make(chan error, 1)
+
+	go func() {
+		time.Sleep(100 * time.Millisecond) // Delay longer than the context timeout
+
+		shutdownCh <- server.Shutdown(ctx)
+	}()
+
+	err := <-shutdownCh
+
+	require.ErrorIs(t, err, context.DeadlineExceeded, "Expected context deadline exceeded error")
+}
+
+func TestValidateCertificateAndKeyFiles_Success(t *testing.T) {
+	certFile := createTempCertFile(t)
+	defer os.Remove(certFile)
+
+	keyFile := createTempKeyFile(t)
+	defer os.Remove(keyFile)
+
+	err := validateCertificateAndKeyFiles(certFile, keyFile)
+
+	require.NoError(t, err, "TestValidateCertificateAndKeyFiles_Success Failed!")
+}
+
+func TestValidateCertificateAndKeyFiles_Error(t *testing.T) {
+	tests := []struct {
+		name          string
+		certFilePath  string
+		keyFilePath   string
+		expectedError error
+	}{
+		{
+			name:          "Certificate file does not exist",
+			certFilePath:  "non-existent-cert.pem",
+			keyFilePath:   createTempKeyFile(t),
+			expectedError: fmt.Errorf("%w : %v", errInvalidCertificateFile, "non-existent-cert.pem"),
+		},
+		{
+			name:          "Key file does not exist",
+			certFilePath:  createTempCertFile(t),
+			keyFilePath:   "non-existent-key.pem",
+			expectedError: fmt.Errorf("%w : %v", errInvalidKeyFile, "non-existent-key.pem"),
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCertificateAndKeyFiles(tc.certFilePath, tc.keyFilePath)
+
+			require.Equal(t, tc.expectedError.Error(), err.Error(),
+				"TestValidateCertificateAndKeyFiles_Error [%d] : %v Failed!", i, tc.name)
+		})
+	}
+}
+
+// Helper function to create a temporary key file.
+func createTempKeyFile(t *testing.T) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), "key-*.pem")
+	if err != nil {
+		t.Fatalf("could not create temp key file: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = f.Close()
+	})
+
+	return f.Name()
+}
+
+// Helper function to create a temporary certificate file.
+func createTempCertFile(t *testing.T) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), "cert-*.pem")
+	if err != nil {
+		t.Fatalf("could not create temp cert file: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = f.Close()
+	})
+
+	return f.Name()
+}
+
+// TestMiddlewareChainShape pins which middlewares are present in the
+// default HTTP server middleware chain, by exercising one request and
+// asserting the observable side-effect of each middleware.
+//
+// If a future PR drops or rewires a middleware (intentional or not),
+// at least one of these checks fails and the PR author must update
+// this test deliberately.
+//
+// Observable signatures (one per middleware):
+//
+//	Tracer:           X-Correlation-ID header on the response
+//	Logging:          a JSON request-log line on stdout
+//	CORS:             Access-Control-Allow-Origin echoed for the Origin header
+//	Metrics:          app_http_response histogram observation > 0
+//	WSHandlerUpgrade: presence is verified by the chain count (it runs only
+//	                  on Upgrade requests, so behavior on a plain GET is a
+//	                  no-op, but the wrap still has to exist for upgrades to
+//	                  work — separate test elsewhere covers upgrade behavior)
+func TestMiddlewareChainShape(t *testing.T) {
+	var (
+		corsHeader     string
+		correlationHdr string
+		respCode       int
+	)
+
+	// Construct the entire pipeline inside StdoutOutputForFunc so the
+	// logger (which captures os.Stdout at NewLogger time) writes into
+	// the redirected pipe.
+	logs := testutil.StdoutOutputForFunc(func() {
+		c := container.NewContainer(config.NewMockConfig(map[string]string{
+			"LOG_LEVEL": "INFO",
+		}))
+
+		mwConfig := middleware.Config{
+			LogProbes:   middleware.LogProbes{},
+			CorsHeaders: map[string]string{"Access-Control-Allow-Origin": "*"},
+		}
+
+		s := newHTTPServer(c, 0, mwConfig)
+		s.router.Add(http.MethodGet, "/chain-check", http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) },
+		))
+
+		// Apply the run-time middleware (WSHandlerUpgrade) the same way
+		// httpServer.run does, but without binding to a port.
+		s.router.Use(middleware.WSHandlerUpgrade(c, s.ws))
+
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/chain-check", http.NoBody)
+		req.Header.Set("Origin", "https://example.com")
+		req.RemoteAddr = "1.2.3.4:5678"
+		req.RequestURI = "/chain-check"
+
+		rr := httptest.NewRecorder()
+		s.router.ServeHTTP(rr, req)
+
+		resp := rr.Result()
+
+		t.Cleanup(func() { _ = resp.Body.Close() })
+
+		corsHeader = resp.Header.Get("Access-Control-Allow-Origin")
+		correlationHdr = resp.Header.Get("X-Correlation-ID")
+		respCode = resp.StatusCode
+	})
+
+	// Tracer + Logging share the X-Correlation-ID header — its presence
+	// proves both are wired (Tracer creates the span context; Logging
+	// reads the trace ID off it and sets the header).
+	assert.NotEmpty(t, correlationHdr,
+		"missing X-Correlation-ID — Tracer/Logging middleware is not wired")
+
+	// CORS middleware echoes the Origin (with the wildcard policy we
+	// configured above, it returns "*").
+	assert.Equal(t, "*", corsHeader,
+		"missing Access-Control-Allow-Origin — CORS middleware is not wired")
+
+	assert.Equal(t, http.StatusOK, respCode, "unexpected status code")
+
+	// Logging middleware writes one JSON request-log line per request.
+	assert.Contains(t, logs, `"method":"GET"`, "Logging middleware did not emit a log line")
+	assert.Contains(t, logs, `"uri":"/chain-check"`, "Logging middleware did not include URI")
+	assert.Contains(t, logs, `"response":200`, "Logging middleware did not include status")
+
+	// Metrics middleware records the response time histogram. The OTel
+	// implementation buffers observations until the metric is scraped,
+	// which is its own contract (TestFrameworkMetricsSnapshot covers
+	// the registration shape). For chain wiring, the four signals above
+	// are sufficient.
+}
+
+// benchDiscardResponseWriter is a zero-cost ResponseWriter for the
+// full-chain microbenchmarks. Avoids per-iter buffer allocation that
+// httptest.NewRecorder would add.
+type benchDiscardResponseWriter struct {
+	h    http.Header
+	code int
+}
+
+func (d *benchDiscardResponseWriter) Header() http.Header {
+	if d.h == nil {
+		d.h = http.Header{}
+	}
+
+	return d.h
+}
+
+// reset returns the writer to the state a FRESH request would find it in.
+//
+// Without it one writer is reused across every iteration, so a header written
+// only when absent -- Content-Type is exactly that -- is set on the first
+// iteration and measured as free on every one after. Any benchmark that reaches
+// Responder.Respond must call this, or it silently understates the response
+// path by one allocation.
+func (d *benchDiscardResponseWriter) reset() {
+	clear(d.Header())
+	d.code = 0
+}
+
+func (*benchDiscardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (d *benchDiscardResponseWriter) WriteHeader(c int)         { d.code = c }
+
+// useGoFrMiddleware applies the same middleware chain that gofr.New() /
+// newHTTPServer + httpServer.run wire — Tracer, Logging, CORS, Metrics,
+// WSHandlerUpgrade — so a benchmark can measure end-to-end request cost
+// through the real chain without binding to a port.
+//
+// This is the ONE definition of that chain for benchmarks. Every bench
+// router goes through it, because a second hand-rolled copy drifts: the
+// first one dropped WSHandlerUpgrade while still claiming to mirror what a
+// GoFr application serves.
+//
+// Keep this in sync with newHTTPServer in http_server.go. Any change to
+// GoFr's middleware composition needs a matching change here.
+func useGoFrMiddleware(r *gofrHTTP.Router, c *container.Container) {
+	r.Use(
+		middleware.Tracer,
+		middleware.Logging(middleware.LogProbes{}, c.Logger),
+		middleware.CORS(map[string]string{}, r.RegisteredRoutes),
+		middleware.Metrics(c.Metrics()),
+		middleware.WSHandlerUpgrade(c, websocket.New()),
+	)
+}
+
+// buildBenchRouter is the router BenchmarkRequest_FullChain measures: the
+// real chain in front of raw http.HandlerFunc routes, so it isolates the
+// middleware cost from GoFr's own handler wrapper.
+func buildBenchRouter(c *container.Container) http.Handler {
+	r := gofrHTTP.NewRouter()
+
+	useGoFrMiddleware(r, c)
+
+	r.Add(http.MethodGet, "/plaintext", http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("OK"))
+		},
+	))
+
+	r.Add(http.MethodGet, "/json", http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"message":"hello"}}`))
+		},
+	))
+
+	return r
+}
+
+// BenchmarkRequest_FullChain is the end-to-end microbenchmark every perf
+// PR diffs against. Exercises the full middleware chain (tracer, logger,
+// CORS, metrics, websocket-upgrade) + router + handler + writer. Uses
+// OTel's default (noop) TracerProvider, so it isolates the framework
+// cost without SDK overhead. Pair with BenchmarkRequest_FullChain_SDK
+// to see the SDK delta.
+func BenchmarkRequest_FullChain(b *testing.B) {
+	c := container.NewContainer(config.NewMockConfig(map[string]string{"LOG_LEVEL": "ERROR"}))
+	h := buildBenchRouter(c)
+	req := httptest.NewRequestWithContext(b.Context(), http.MethodGet, "/plaintext", http.NoBody)
+	w := &benchDiscardResponseWriter{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		w.reset()
+		h.ServeHTTP(w, req)
+	}
+}
+
+// BenchmarkRequest_FullChain_JSON runs the same chain against the /json
+// handler. Pairs with the /json endpoint in the wrk benchmarks.
+//
+// It does NOT exercise the response-envelope pooling in this PR, and should not
+// be cited as evidence for it: /json is registered as a raw http.HandlerFunc
+// that writes its bytes directly, so it never reaches Responder.Respond. The
+// responder-level benchmarks are what demonstrate that change. The writer reset
+// below is kept for symmetry with the sibling benchmarks, where it is load
+// bearing.
+func BenchmarkRequest_FullChain_JSON(b *testing.B) {
+	c := container.NewContainer(config.NewMockConfig(map[string]string{"LOG_LEVEL": "ERROR"}))
+	h := buildBenchRouter(c)
+	req := httptest.NewRequestWithContext(b.Context(), http.MethodGet, "/json", http.NoBody)
+	w := &benchDiscardResponseWriter{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		w.reset()
+		h.ServeHTTP(w, req)
+	}
+}
+
+// BenchmarkRequest_FullChain_SDK runs the same chain with an SDK
+// TracerProvider installed (ParentBased(TraceIDRatioBased(1.0)) —
+// today's real default from initTracer in otel.go). Recording spans
+// get built and discarded.
+//
+// Delta vs BenchmarkRequest_FullChain is what PR-1 is forecast to save
+// end-to-end for users without a TRACE_EXPORTER configured.
+func BenchmarkRequest_FullChain_SDK(b *testing.B) {
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(resource.Empty()),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(1.0))),
+	)
+	otel.SetTracerProvider(tp)
+
+	b.Cleanup(func() {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+	})
+
+	c := container.NewContainer(config.NewMockConfig(map[string]string{"LOG_LEVEL": "ERROR"}))
+	h := buildBenchRouter(c)
+	req := httptest.NewRequestWithContext(b.Context(), http.MethodGet, "/plaintext", http.NoBody)
+	w := &benchDiscardResponseWriter{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		w.reset()
+		h.ServeHTTP(w, req)
+	}
+}
+
+// TestLogRouterChoice covers the three shapes GOFR_ROUTER can take at startup.
+// The unrecognized case is the one that earns the log: it falls back to mux,
+// which is indistinguishable from leaving the variable unset, so without a
+// warning a typo costs the opt-in silently.
+func TestLogRouterChoice(t *testing.T) {
+	// The logger emits JSON, so quotes inside a message come back escaped — want
+	// is a fragment chosen to survive that.
+	cases := []struct {
+		name      string
+		env       string
+		want      string
+		wantLevel string
+	}{
+		{"unset stays quiet", "", "", ""},
+		{"trie is announced", gofrHTTP.MatcherTrie, "HTTP route matcher: trie", "INFO"},
+		{"typo is warned about", "tri", "unrecognized GOFR_ROUTER value", "WARN"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Always set it, empty included: the suite itself may be run with
+			// GOFR_ROUTER exported, and the "unset" case has to mean unset.
+			t.Setenv(gofrHTTP.RouterEnvVar, tc.env)
+
+			logs := testutil.StdoutOutputForFunc(func() {
+				c := container.NewContainer(config.NewMockConfig(map[string]string{"LOG_LEVEL": "INFO"}))
+				logRouterChoice(c.Logger, gofrHTTP.NewRouter())
+			})
+
+			if tc.wantLevel == "" {
+				assert.NotContains(t, logs, "route matcher")
+				assert.NotContains(t, logs, gofrHTTP.RouterEnvVar)
+
+				return
+			}
+
+			assert.Contains(t, logs, tc.want)
+			assert.Contains(t, logs, `"level":"`+tc.wantLevel+`"`)
+		})
+	}
+}
+
+// TestRouter_Matcher pins the accessor the startup log reads: it must report
+// what NewRouter actually resolved from the environment, including the fallback
+// to mux for a value that is not understood.
+func TestRouter_Matcher(t *testing.T) {
+	cases := map[string]string{
+		"":     gofrHTTP.MatcherMux,
+		"mux":  gofrHTTP.MatcherMux,
+		"trie": gofrHTTP.MatcherTrie,
+		"TRIE": gofrHTTP.MatcherTrie, // the lookup is case-insensitive
+		"tri":  gofrHTTP.MatcherMux,  // unrecognized falls back
+	}
+
+	for env, want := range cases {
+		t.Run("GOFR_ROUTER="+env, func(t *testing.T) {
+			t.Setenv(gofrHTTP.RouterEnvVar, env)
+			assert.Equal(t, want, gofrHTTP.NewRouter().Matcher())
+		})
+	}
+}
+
+func TestHTTPServer_run_DoesNotServe(t *testing.T) {
+	tests := []struct {
+		desc       string
+		setup      func(t *testing.T) *httpServer
+		setupMocks func(l *container.MockLogger, port int)
+	}{
+		{
+			desc: "shut down before it started",
+			setup: func(t *testing.T) *httpServer {
+				t.Helper()
+
+				return &httpServer{router: gofrHTTP.NewRouter(), port: testutil.GetFreePort(t), stopped: true}
+			},
+			setupMocks: func(l *container.MockLogger, port int) {
+				l.EXPECT().Logf("Server was shut down before it started on port: %d", port)
+			},
+		},
+		{
+			desc: "certificate files missing",
+			setup: func(t *testing.T) *httpServer {
+				t.Helper()
+
+				return &httpServer{router: gofrHTTP.NewRouter(), port: testutil.GetFreePort(t),
+					certFile: "missing-cert.pem", keyFile: "missing-key.pem"}
+			},
+			setupMocks: func(l *container.MockLogger, port int) {
+				l.EXPECT().Logf("Starting server on port: %d", port)
+				l.EXPECT().Error(fmt.Errorf("%w : %v", errInvalidCertificateFile, "missing-cert.pem"))
+			},
+		},
+		{
+			desc: "certificate files unparsable",
+			setup: func(t *testing.T) *httpServer {
+				t.Helper()
+
+				return &httpServer{router: gofrHTTP.NewRouter(), port: testutil.GetFreePort(t),
+					certFile: createTempCertFile(t), keyFile: createTempKeyFile(t)}
+			},
+			setupMocks: func(l *container.MockLogger, port int) {
+				l.EXPECT().Logf("Starting server on port: %d", port)
+				l.EXPECT().Errorf("error while listening to https server, err: %v", gomock.Any())
+			},
+		},
+		{
+			desc: "port already in use",
+			setup: func(t *testing.T) *httpServer {
+				t.Helper()
+
+				listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", ":0")
+				require.NoError(t, err)
+
+				t.Cleanup(func() { listener.Close() })
+
+				return &httpServer{router: gofrHTTP.NewRouter(), port: listener.Addr().(*net.TCPAddr).Port}
+			},
+			setupMocks: func(l *container.MockLogger, port int) {
+				l.EXPECT().Logf("Starting server on port: %d", port)
+				l.EXPECT().Errorf("error while listening to http server, err: %v", gomock.Any())
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			s := tc.setup(t)
+			s.ws = websocket.New()
+
+			logger := container.NewMockLogger(gomock.NewController(t))
+			tc.setupMocks(logger, s.port)
+
+			// run returns on its own in every case: nothing is left listening.
+			s.run(&container.Container{Logger: logger})
+
+			require.NoError(t, s.Shutdown(t.Context()))
+		})
+	}
+}
+
+// TestNewHTTPServer_MetricsUnmatchedLimit builds the server the way Run does and reads the
+// recorded app_http_response paths back from the Prometheus registry, so it fails if the
+// METRICS_UNMATCHED_LIMIT wiring in newHTTPServer is removed.
+func TestNewHTTPServer_MetricsUnmatchedLimit(t *testing.T) {
+	tests := []struct {
+		name     string
+		configs  func() middleware.Config
+		target   string
+		expected string
+	}{
+		{
+			name: "METRICS_UNMATCHED_LIMIT=0 collapses a scanner path",
+			configs: func() middleware.Config {
+				return middleware.GetConfigs(config.NewMockConfig(map[string]string{"METRICS_UNMATCHED_LIMIT": "0"}))
+			},
+			target:   "/scanner-limit-zero/.env",
+			expected: "__unmatched__",
+		},
+		{
+			name:     "unset keeps the default budget and records the path",
+			configs:  func() middleware.Config { return middleware.GetConfigs(config.NewMockConfig(nil)) },
+			target:   "/scanner-limit-unset/.env",
+			expected: "/scanner-limit-unset/.env",
+		},
+		{
+			name:     "a zero-value Config keeps the default budget",
+			configs:  func() middleware.Config { return middleware.Config{} },
+			target:   "/scanner-zero-config/.env",
+			expected: "/scanner-zero-config/.env",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The Prometheus reader registers on the default registerer, which only the first
+			// container in the process can claim; give this one a registry of its own.
+			reg := prometheus.NewRegistry()
+			oldRegisterer, oldGatherer := prometheus.DefaultRegisterer, prometheus.DefaultGatherer
+			prometheus.DefaultRegisterer, prometheus.DefaultGatherer = reg, reg
+
+			t.Cleanup(func() { prometheus.DefaultRegisterer, prometheus.DefaultGatherer = oldRegisterer, oldGatherer })
+
+			c := container.NewContainer(config.NewMockConfig(map[string]string{"LOG_LEVEL": "ERROR"}))
+			s := newHTTPServer(c, 0, tt.configs())
+
+			// App.Run registers this catch-all, and it is what lets an unmatched request reach the middleware.
+			routemark.MarkCatchAll(s.router.PathPrefix("/")).Handler(http.NotFoundHandler())
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, http.NoBody)
+			req.RemoteAddr = "1.2.3.4:5678"
+			req.RequestURI = tt.target
+
+			s.router.ServeHTTP(httptest.NewRecorder(), req)
+
+			families, err := reg.Gather()
+			require.NoError(t, err)
+
+			var paths []string
+
+			for _, f := range families {
+				if f.GetName() != "app_http_response" {
+					continue
+				}
+
+				for _, m := range f.GetMetric() {
+					for _, l := range m.GetLabel() {
+						if l.GetName() == "path" {
+							paths = append(paths, l.GetValue())
+						}
+					}
+				}
+			}
+
+			assert.Equal(t, []string{tt.expected}, paths)
+		})
+	}
+}

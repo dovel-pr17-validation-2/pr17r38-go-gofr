@@ -1,0 +1,51 @@
+package migration
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"gofr.dev/pkg/gofr/container"
+	"gofr.dev/pkg/gofr/testutil"
+)
+
+func Test_getMigratorDatastoreNotInitialized(t *testing.T) {
+	logs := testutil.StdoutOutputForFunc(func() {
+		mockContainer, _ := container.NewMockContainer(t)
+		mockContainer.SQL = nil
+		mockContainer.Redis = nil
+
+		mg := Datasource{}
+
+		mg.rollback(mockContainer, &transactionData{})
+
+		applied, err := mg.getAppliedMigrations(mockContainer)
+		require.NoError(t, err)
+		assert.Equal(t, map[int64]struct{}{}, applied, "TEST Failed \n Applied migrations is not an empty set")
+		require.NoError(t, mg.checkAndCreateMigrationTable(mockContainer), "TEST Failed")
+		assert.Equal(t, transactionData{}, mg.beginTransaction(mockContainer), "TEST Failed")
+		require.NoError(t, mg.commitMigration(mockContainer, &transactionData{}), "TEST Failed")
+	})
+
+	assert.Contains(t, logs, "Migration 0 ran successfully", "TEST Failed")
+}
+
+func Test_lock_unlock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockContainer, _ := container.NewMockContainer(t)
+	ds := Datasource{}
+
+	err := ds.lock(t.Context(), nil, mockContainer, "owner")
+	require.NoError(t, err)
+
+	err = ds.unlock(mockContainer, "owner")
+	require.NoError(t, err)
+}
+
+func Test_DatasourceName(t *testing.T) {
+	assert.Equal(t, "Base", Datasource{}.name())
+}

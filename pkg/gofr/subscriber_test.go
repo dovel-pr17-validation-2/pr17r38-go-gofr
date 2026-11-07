@@ -1,0 +1,284 @@
+package gofr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"gofr.dev/pkg/gofr/container"
+	"gofr.dev/pkg/gofr/datasource"
+	"gofr.dev/pkg/gofr/datasource/pubsub"
+	"gofr.dev/pkg/gofr/datasource/pubsub/kafka"
+	"gofr.dev/pkg/gofr/logging"
+)
+
+var (
+	errSubscription = errors.New("subscription error")
+	errHandlerFail  = errors.New("handler failed")
+)
+
+func subscriptionError(err string) error {
+	return fmt.Errorf("%w: %s", errSubscription, err)
+}
+
+type mockSubscriber struct {
+}
+
+func (mockSubscriber) Query(_ context.Context, _ string, _ ...any) ([]byte, error) {
+	return nil, nil
+}
+
+func (mockSubscriber) CreateTopic(_ context.Context, _ string) error {
+	return nil
+}
+
+func (mockSubscriber) DeleteTopic(_ context.Context, _ string) error {
+	return nil
+}
+
+func (mockSubscriber) Health() datasource.Health {
+	return datasource.Health{}
+}
+
+func (mockSubscriber) Publish(_ context.Context, _ string, _ []byte) error {
+	return nil
+}
+
+func (mockSubscriber) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
+	msg := pubsub.NewMessage(ctx)
+	msg.Topic = topic
+	msg.Value = []byte(`{"data":{"productId":"123","price":"599"}}`)
+
+	if topic == "test-topic" {
+		return msg, nil
+	} else if topic == "test-err" {
+		return msg, kafka.ErrConsumerGroupNotProvided
+	}
+
+	return msg, subscriptionError("subscription error")
+}
+
+func (mockSubscriber) Close() error {
+	return nil
+}
+
+const (
+	topicHandleSubPanic = "handle-sub-panic"
+	topicHandleSubOK    = "handle-sub-ok"
+	topicHandleSubErr   = "handle-sub-err"
+)
+
+// countingCommitter records Commit calls for tests.
+type countingCommitter struct {
+	n int
+}
+
+func (c *countingCommitter) Commit() {
+	c.n++
+}
+
+// handleSubscriptionTestPubSub returns messages with a counting committer for selected topics.
+// lastCommitter is the spy for the most recent Subscribe matching those topics.
+type handleSubscriptionTestPubSub struct {
+	mockSubscriber
+	lastCommitter *countingCommitter
+}
+
+func (h *handleSubscriptionTestPubSub) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
+	msg := pubsub.NewMessage(ctx)
+	msg.Topic = topic
+	msg.Value = []byte(`{}`)
+
+	switch topic {
+	case topicHandleSubPanic, topicHandleSubOK, topicHandleSubErr:
+		h.lastCommitter = &countingCommitter{}
+		msg.Committer = h.lastCommitter
+
+		return msg, nil
+	default:
+		return (&mockSubscriber{}).Subscribe(ctx, topic)
+	}
+}
+
+func TestSubscriptionManager_handleSubscription_SuccessCommits(t *testing.T) {
+	t.Parallel()
+
+	ps := &handleSubscriptionTestPubSub{}
+	c := &container.Container{
+		Logger: logging.NewMockLogger(logging.ERROR),
+		PubSub: ps,
+	}
+	s := SubscriptionManager{container: c}
+
+	err := s.handleSubscription(t.Context(), topicHandleSubOK, func(*Context) error { return nil })
+	require.NoError(t, err)
+	require.NotNil(t, ps.lastCommitter)
+	require.Equal(t, 1, ps.lastCommitter.n, "successful handler must commit once")
+}
+
+func TestSubscriptionManager_handleSubscription_PanicDoesNotCommit(t *testing.T) {
+	t.Parallel()
+
+	ps := &handleSubscriptionTestPubSub{}
+	c := &container.Container{
+		Logger: logging.NewMockLogger(logging.ERROR),
+		PubSub: ps,
+	}
+	s := SubscriptionManager{container: c}
+
+	err := s.handleSubscription(t.Context(), topicHandleSubPanic, func(*Context) error {
+		panic("boom")
+	})
+	require.NoError(t, err)
+	require.NotNil(t, ps.lastCommitter)
+	require.Zero(t, ps.lastCommitter.n, "panic must not commit the message")
+}
+
+func TestSubscriptionManager_handleSubscription_HandlerErrorDoesNotCommit(t *testing.T) {
+	t.Parallel()
+
+	ps := &handleSubscriptionTestPubSub{}
+	c := &container.Container{
+		Logger: logging.NewMockLogger(logging.ERROR),
+		PubSub: ps,
+	}
+	s := SubscriptionManager{container: c}
+
+	err := s.handleSubscription(t.Context(), topicHandleSubErr, func(*Context) error { return errHandlerFail })
+	require.ErrorIs(t, err, errHandlerFail, "handler error must propagate so startSubscriber can back off")
+	require.NotNil(t, ps.lastCommitter)
+	require.Zero(t, ps.lastCommitter.n, "handler error must not commit")
+}
+
+var errPanicValue = errors.New("panic error value")
+
+// cancelingSubscriber cancels the subscriber loop's context on every Subscribe, so startSubscriber
+// observes shutdown on its next iteration without relying on timing.
+type cancelingSubscriber struct {
+	mockSubscriber
+	cancel context.CancelFunc
+	err    error
+}
+
+func (c *cancelingSubscriber) Subscribe(context.Context, string) (*pubsub.Message, error) {
+	c.cancel()
+
+	return nil, c.err
+}
+
+func TestSubscriptionManager_startSubscriber(t *testing.T) {
+	tests := []struct {
+		desc       string
+		subErr     error
+		setupMocks func(l *container.MockLogger)
+	}{
+		{
+			desc:   "no message then shutdown",
+			subErr: nil,
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Infof("shutting down subscriber for topic %s", "orders")
+			},
+		},
+		{
+			desc:   "subscribe error is logged then shutdown",
+			subErr: errSubscription,
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Errorf("error while reading from topic %v, err: %v", "orders", errSubscription.Error())
+				l.EXPECT().Errorf("error in subscription for topic %s: %v", "orders", errSubscription)
+				l.EXPECT().Infof("shutting down subscriber for topic %s", "orders")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			logger := container.NewMockLogger(ctrl)
+			tc.setupMocks(logger)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			s := newSubscriptionManager(&container.Container{
+				Logger: logger,
+				PubSub: &cancelingSubscriber{cancel: cancel, err: tc.subErr},
+			})
+
+			err := s.startSubscriber(ctx, "orders", func(*Context) error { return nil })
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSubscriptionManager_handleSubscription_WithoutCommitter(t *testing.T) {
+	tests := []struct {
+		desc      string
+		topic     string
+		expCalled bool
+		expErr    error
+	}{
+		{desc: "message without committer is handled", topic: "test-topic", expCalled: true, expErr: nil},
+		{desc: "subscribe error is returned", topic: "test-err", expCalled: false, expErr: kafka.ErrConsumerGroupNotProvided},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			var called bool
+
+			s := SubscriptionManager{container: &container.Container{
+				Logger: logging.NewMockLogger(logging.FATAL),
+				PubSub: mockSubscriber{},
+			}}
+
+			err := s.handleSubscription(t.Context(), tc.topic, func(*Context) error {
+				called = true
+				return nil
+			})
+
+			require.ErrorIs(t, err, tc.expErr)
+			assert.Equal(t, tc.expCalled, called)
+		})
+	}
+}
+
+func TestPanicRecovery(t *testing.T) {
+	tests := []struct {
+		desc      string
+		recovered any
+		expCalls  int
+		expError  string
+	}{
+		{desc: "nil value is ignored", recovered: nil, expCalls: 0, expError: ""},
+		{desc: "string panic", recovered: "boom", expCalls: 1, expError: "boom"},
+		{desc: "error panic", recovered: errPanicValue, expCalls: 1, expError: errPanicValue.Error()},
+		{desc: "unknown panic type", recovered: 42, expCalls: 1, expError: "Unknown panic type"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			logger := container.NewMockLogger(ctrl)
+
+			var logged []panicLog
+
+			logger.EXPECT().Error(gomock.Any()).Do(func(args ...any) {
+				logged = append(logged, args[0].(panicLog))
+			}).Times(tc.expCalls)
+
+			panicRecovery(tc.recovered, logger)
+
+			require.Len(t, logged, tc.expCalls)
+
+			for _, l := range logged {
+				assert.Equal(t, tc.expError, l.Error)
+				assert.NotEmpty(t, l.StackTrace)
+			}
+		})
+	}
+}

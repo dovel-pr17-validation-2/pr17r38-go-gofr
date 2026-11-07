@@ -1,0 +1,632 @@
+package ftp
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/textproto"
+	"path"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jlaffaye/ftp"
+	"gofr.dev/pkg/gofr/datasource/file"
+)
+
+var (
+	// Storage adapter errors.
+	errFTPConfigNil            = errors.New("FTP config is nil")
+	errFTPClientNotInitialized = errors.New("FTP client is not initialized")
+	errEmptyObjectName         = errors.New("object name is empty")
+	errInvalidOffset           = errors.New("invalid offset: must be >= 0")
+	errEmptySourceOrDest       = errors.New("source and destination names cannot be empty")
+	errSameSourceAndDest       = errors.New("source and destination are the same")
+	errFailedToCreateReader    = errors.New("failed to create reader")
+	errFailedToCreateWriter    = errors.New("failed to create writer")
+	errObjectNotFound          = errors.New("object not found")
+	errFailedToGetObjectAttrs  = errors.New("failed to get object attrs")
+	errFailedToDeleteObject    = errors.New("failed to delete object")
+	errFailedToListObjects     = errors.New("failed to list objects")
+	errFailedToListDirectory   = errors.New("failed to list directory")
+	errWriterAlreadyClosed     = errors.New("writer already closed")
+	errFTPConfigInvalid        = errors.New("invalid FTP configuration: host and port are required")
+)
+
+// Config represents the FTP configuration.
+type Config struct {
+	Host        string        // FTP server hostname
+	User        string        // FTP username
+	Password    string        // FTP password
+	Port        int           // FTP port
+	RemoteDir   string        // Remote directory path. Base Path for all FTP Operations.
+	DialTimeout time.Duration // FTP connection timeout
+}
+
+// storageAdapter adapts FTP client to implement file.StorageProvider.
+type storageAdapter struct {
+	cfg *Config
+
+	// mu guards conn. Connect may run on the background retry goroutine while request
+	// goroutines use the adapter, so conn is published under mu and read through serverConn.
+	mu   sync.RWMutex
+	conn *ftp.ServerConn
+
+	// cmdMu serializes commands on conn. An ftp.ServerConn is not safe for concurrent use
+	// and supports only one data transfer at a time, so every use of conn, including the
+	// data transfer it starts, runs under cmdMu. Readers use their own connection instead
+	// (see openReader), because their transfer stays open until the caller closes them.
+	cmdMu sync.Mutex
+}
+
+// Connect initializes the FTP client and logs in to the server.
+func (s *storageAdapter) Connect(_ context.Context) error {
+	// fast-path: already connected
+	if _, err := s.serverConn(); err == nil {
+		return nil
+	}
+
+	conn, err := s.dial()
+	if err != nil {
+		return err
+	}
+
+	s.publishConn(conn)
+
+	return nil
+}
+
+// dial opens a new control connection to the configured server and logs in.
+func (s *storageAdapter) dial() (*ftp.ServerConn, error) {
+	if s.cfg == nil {
+		return nil, errFTPConfigNil
+	}
+
+	if s.cfg.Host == "" || s.cfg.Port <= 0 {
+		return nil, errFTPConfigInvalid
+	}
+
+	// Set default timeout if not specified
+	dialTimeout := s.cfg.DialTimeout
+	if dialTimeout == 0 {
+		dialTimeout = 5 * time.Second
+	}
+
+	ftpServer := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+
+	conn, err := ftp.Dial(ftpServer, ftp.DialWithTimeout(dialTimeout))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial FTP server %q: %w", ftpServer, err)
+	}
+
+	if err := conn.Login(s.cfg.User, s.cfg.Password); err != nil {
+		_ = conn.Quit()
+		return nil, fmt.Errorf("FTP login failed for user %q: %w", s.cfg.User, err)
+	}
+
+	return conn, nil
+}
+
+// publishConn stores the connection built by Connect. If a concurrent Connect call has
+// already stored one, that connection is kept and the redundant one is closed.
+func (s *storageAdapter) publishConn(conn *ftp.ServerConn) {
+	s.mu.Lock()
+
+	published := s.conn != nil
+	if !published {
+		s.conn = conn
+	}
+
+	s.mu.Unlock()
+
+	if published {
+		_ = conn.Quit()
+	}
+}
+
+// serverConn returns the connected FTP connection, or errFTPClientNotInitialized while
+// the adapter is not connected.
+func (s *storageAdapter) serverConn() (*ftp.ServerConn, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.conn == nil {
+		return nil, errFTPClientNotInitialized
+	}
+
+	return s.conn, nil
+}
+
+// NewReader creates a reader for the given object.
+func (s *storageAdapter) NewReader(_ context.Context, name string) (io.ReadCloser, error) {
+	if name == "" {
+		return nil, errEmptyObjectName
+	}
+
+	if _, err := s.serverConn(); err != nil {
+		return nil, err
+	}
+
+	reader, err := s.openReader(name, 0)
+	if errors.Is(err, errObjectNotFound) {
+		return nil, err
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("%w for %q: %w", errFailedToCreateReader, name, err)
+	}
+
+	return reader, nil
+}
+
+// openReader starts a RETR of name from offset on a dedicated connection, so the transfer
+// can stay open until the caller closes the reader without blocking the shared connection.
+// The dedicated connection is closed together with the reader. The caller checks that the
+// adapter is connected first.
+//
+// Only a failed RETR is reported as errObjectNotFound. A failure to dial or log in on the
+// dedicated connection is returned as is: it says nothing about the object, and its text
+// (host, port, user) must never be mistaken for a "not found" reply.
+func (s *storageAdapter) openReader(name string, offset uint64) (*connReader, error) {
+	conn, err := s.dial()
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := conn.RetrFrom(s.buildPath(name), offset)
+	if err != nil {
+		_ = conn.Quit()
+
+		if isFTPNotFoundError(err) {
+			return nil, fmt.Errorf("%w %q: %w", errObjectNotFound, name, err)
+		}
+
+		return nil, err
+	}
+
+	return &connReader{resp: resp, conn: conn}, nil
+}
+
+// connReader is a RETR transfer that owns its control connection.
+type connReader struct {
+	resp   *ftp.Response
+	conn   *ftp.ServerConn
+	closed atomic.Bool
+}
+
+func (r *connReader) Read(p []byte) (int, error) {
+	return r.resp.Read(p)
+}
+
+// Close ends the transfer and closes the connection. Later calls do nothing.
+func (r *connReader) Close() error {
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	return errors.Join(r.resp.Close(), r.conn.Quit())
+}
+
+// NewRangeReader creates a range reader for the given object.
+func (s *storageAdapter) NewRangeReader(_ context.Context, name string, offset, length int64) (io.ReadCloser, error) {
+	if name == "" {
+		return nil, errEmptyObjectName
+	}
+
+	if offset < 0 {
+		return nil, fmt.Errorf("%w (got: %d)", errInvalidOffset, offset)
+	}
+
+	if _, err := s.serverConn(); err != nil {
+		return nil, err
+	}
+
+	reader, err := s.openReader(name, uint64(offset))
+	if errors.Is(err, errObjectNotFound) {
+		return nil, err
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("%w for %q at offset %d: %w", errFailedToCreateReader, name, offset, err)
+	}
+
+	// FTP doesn't support length limit in RetrFrom, so wrap in LimitReader
+	if length > 0 {
+		return &limitedReadCloser{
+			Reader: io.LimitReader(reader, length),
+			Closer: reader,
+		}, nil
+	}
+
+	return reader, nil
+}
+
+// limitedReadCloser combines io.LimitReader with Close capability.
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// NewWriter creates a writer for the given object.
+func (s *storageAdapter) NewWriter(_ context.Context, name string) io.WriteCloser {
+	if name == "" {
+		return &failWriter{err: errEmptyObjectName}
+	}
+
+	conn, err := s.serverConn()
+	if err != nil {
+		return &failWriter{err: err}
+	}
+
+	objectPath := s.buildPath(name)
+
+	return &ftpWriter{
+		conn:       conn,
+		cmdMu:      &s.cmdMu,
+		objectPath: objectPath,
+		buffer:     &bytes.Buffer{},
+	}
+}
+
+// ftpWriter buffers writes and uploads on Close.
+type ftpWriter struct {
+	conn       *ftp.ServerConn
+	cmdMu      *sync.Mutex // the adapter's cmdMu, held while Close uploads on conn
+	objectPath string
+	buffer     *bytes.Buffer
+	closed     atomic.Bool
+}
+
+func (fw *ftpWriter) Write(p []byte) (int, error) {
+	if fw.closed.Load() {
+		return 0, errWriterAlreadyClosed
+	}
+
+	return fw.buffer.Write(p)
+}
+
+func (fw *ftpWriter) Close() error {
+	if !fw.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	fw.cmdMu.Lock()
+	defer fw.cmdMu.Unlock()
+
+	if err := fw.conn.Stor(fw.objectPath, fw.buffer); err != nil {
+		return fmt.Errorf("%w for %q: %w", errFailedToCreateWriter, fw.objectPath, err)
+	}
+
+	return nil
+}
+
+// failWriter is a helper for NewWriter validation errors.
+type failWriter struct {
+	err error
+}
+
+func (fw *failWriter) Write([]byte) (int, error) {
+	return 0, fw.err
+}
+
+func (fw *failWriter) Close() error {
+	return fw.err
+}
+
+// DeleteObject deletes the object with the given name.
+func (s *storageAdapter) DeleteObject(_ context.Context, name string) error {
+	if name == "" {
+		return errEmptyObjectName
+	}
+
+	conn, err := s.serverConn()
+	if err != nil {
+		return err
+	}
+
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	objectPath := s.buildPath(name)
+
+	if err := conn.Delete(objectPath); err != nil {
+		if isFTPNotFoundError(err) {
+			return fmt.Errorf("%w %q: %w", errObjectNotFound, name, err)
+		}
+
+		return fmt.Errorf("%w %q: %w", errFailedToDeleteObject, name, err)
+	}
+
+	return nil
+}
+
+// CopyObject copies an object from src to dst.
+func (s *storageAdapter) CopyObject(_ context.Context, source, dest string) error {
+	if source == "" || dest == "" {
+		return errEmptySourceOrDest
+	}
+
+	if source == dest {
+		return errSameSourceAndDest
+	}
+
+	conn, err := s.serverConn()
+	if err != nil {
+		return err
+	}
+
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	// Read source file
+	sourcePath := s.buildPath(source)
+
+	resp, err := conn.Retr(sourcePath)
+	if err != nil {
+		if isFTPNotFoundError(err) {
+			return fmt.Errorf("%w: %q", errObjectNotFound, source)
+		}
+
+		return fmt.Errorf("failed to read source object %q: %w", source, err)
+	}
+
+	// Read all data from source into memory
+	data, err := io.ReadAll(resp)
+
+	closeErr := resp.Close()
+
+	if err != nil {
+		return fmt.Errorf("failed to read source object data %q: %w", source, err)
+	}
+
+	if closeErr != nil {
+		return fmt.Errorf("failed to close source reader for %q: %w", source, closeErr)
+	}
+
+	// Write to destination
+	destPath := s.buildPath(dest)
+	if err := conn.Stor(destPath, bytes.NewReader(data)); err != nil {
+		return fmt.Errorf("failed to write destination object %q: %w", dest, err)
+	}
+
+	return nil
+}
+
+// StatObject returns metadata for the given object.
+func (s *storageAdapter) StatObject(_ context.Context, name string) (*file.ObjectInfo, error) {
+	if name == "" {
+		return nil, errEmptyObjectName
+	}
+
+	conn, err := s.serverConn()
+	if err != nil {
+		return nil, err
+	}
+
+	objectPath := s.buildPath(name)
+
+	entries, err := s.list(conn, objectPath)
+	if err != nil {
+		if isFTPNotFoundError(err) {
+			return nil, fmt.Errorf("%w %q: %w", errObjectNotFound, name, err)
+		}
+
+		return nil, fmt.Errorf("%w for %q: %w", errFailedToGetObjectAttrs, name, err)
+	}
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w %q", errObjectNotFound, name)
+	}
+
+	entry := entries[0]
+
+	return &file.ObjectInfo{
+		Name:         entry.Name,
+		Size:         safeUint64ToInt64(entry.Size),
+		ContentType:  getContentType(entry),
+		LastModified: entry.Time,
+		IsDir:        entry.Type == ftp.EntryTypeFolder,
+	}, nil
+}
+
+// ListObjects lists all objects with the given prefix.
+func (s *storageAdapter) ListObjects(_ context.Context, prefix string) ([]string, error) {
+	conn, err := s.serverConn()
+	if err != nil {
+		return nil, err
+	}
+
+	dirPath := s.buildPath(prefix)
+
+	// If prefix is empty or is the base directory, list from RemoteDir
+	if prefix == "" || prefix == "." {
+		dirPath = s.cfg.RemoteDir
+	}
+
+	entries, err := s.list(conn, dirPath)
+	if err != nil {
+		if isFTPNotFoundError(err) {
+			return []string{}, nil // Return empty list for non-existent directories
+		}
+
+		return nil, fmt.Errorf("%w with prefix %q: %w", errFailedToListObjects, prefix, err)
+	}
+
+	var objects []string
+
+	for _, entry := range entries {
+		if entry.Type != ftp.EntryTypeFolder {
+			// Build relative path from RemoteDir
+			relativePath := entry.Name
+			if prefix != "" && prefix != "." {
+				relativePath = path.Join(prefix, entry.Name)
+			}
+
+			objects = append(objects, relativePath)
+		}
+	}
+
+	return objects, nil
+}
+
+// ListDir lists objects and prefixes (directories) under the given prefix.
+func (s *storageAdapter) ListDir(_ context.Context, prefix string) ([]file.ObjectInfo, []string, error) {
+	conn, err := s.serverConn()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dirPath := s.resolveDirPath(prefix)
+
+	entries, err := s.list(conn, dirPath)
+	if err != nil {
+		return s.handleListError(err, prefix)
+	}
+
+	return s.processEntries(entries, prefix)
+}
+
+// list runs LIST on the shared connection under cmdMu.
+func (s *storageAdapter) list(conn *ftp.ServerConn, dirPath string) ([]*ftp.Entry, error) {
+	s.cmdMu.Lock()
+	defer s.cmdMu.Unlock()
+
+	return conn.List(dirPath)
+}
+
+// resolveDirPath resolves the directory path for listing.
+func (s *storageAdapter) resolveDirPath(prefix string) string {
+	if prefix == "" || prefix == "." {
+		return s.cfg.RemoteDir
+	}
+
+	return s.buildPath(prefix)
+}
+
+// handleListError handles errors from List operation.
+func (*storageAdapter) handleListError(err error, prefix string) ([]file.ObjectInfo, []string, error) {
+	if isFTPNotFoundError(err) {
+		return []file.ObjectInfo{}, []string{}, nil
+	}
+
+	return nil, nil, fmt.Errorf("%w %q: %w", errFailedToListDirectory, prefix, err)
+}
+
+// processEntries processes FTP entries into objects and prefixes.
+func (s *storageAdapter) processEntries(entries []*ftp.Entry, prefix string) ([]file.ObjectInfo, []string, error) {
+	var (
+		objects  []file.ObjectInfo
+		prefixes []string
+	)
+
+	for _, entry := range entries {
+		if entry.Type == ftp.EntryTypeFolder {
+			prefixes = append(prefixes, s.buildDirPrefix(entry.Name, prefix))
+		} else {
+			objects = append(objects, s.buildObjectInfo(entry, prefix))
+		}
+	}
+
+	return objects, prefixes, nil
+}
+
+// buildDirPrefix constructs a directory prefix.
+func (*storageAdapter) buildDirPrefix(name, prefix string) string {
+	if prefix != "" && prefix != "." {
+		return path.Join(prefix, name) + "/"
+	}
+
+	return name + "/"
+}
+
+// buildObjectInfo constructs file.ObjectInfo from FTP entry.
+func (*storageAdapter) buildObjectInfo(entry *ftp.Entry, prefix string) file.ObjectInfo {
+	objectName := entry.Name
+	if prefix != "" && prefix != "." {
+		objectName = path.Join(prefix, entry.Name)
+	}
+
+	return file.ObjectInfo{
+		Name:         objectName,
+		Size:         safeUint64ToInt64(entry.Size),
+		ContentType:  getContentType(entry),
+		LastModified: entry.Time,
+		IsDir:        false,
+	}
+}
+
+// buildPath constructs the full path by joining RemoteDir with the given name.
+func (s *storageAdapter) buildPath(name string) string {
+	if s.cfg.RemoteDir == "" || s.cfg.RemoteDir == "/" {
+		return name
+	}
+
+	return path.Join(s.cfg.RemoteDir, name)
+}
+
+// isFTPNotFoundError reports whether err is the server's reply that the object doesn't exist:
+// a 550 or 551 reply, or a reply whose text says so. Only server replies count. jlaffaye/ftp
+// returns them as *textproto.Error, so a local network or dial error never matches, whatever
+// address, port or user name appears in its text.
+func isFTPNotFoundError(err error) bool {
+	var reply *textproto.Error
+	if !errors.As(err, &reply) {
+		return false
+	}
+
+	return reply.Code == ftp.StatusFileUnavailable ||
+		reply.Code == ftp.StatusPageTypeUnknown ||
+		strings.Contains(reply.Msg, "No such file") ||
+		strings.Contains(reply.Msg, "not found")
+}
+
+// Content types returned by getContentType.
+const (
+	contentTypeText        = "text/plain; charset=utf-8"
+	contentTypeHTML        = "text/html"
+	contentTypeJPEG        = "image/jpeg"
+	contentTypeOctetStream = "application/octet-stream"
+)
+
+// getContentType determines content type based on file extension or type.
+func getContentType(entry *ftp.Entry) string {
+	if entry.Type == ftp.EntryTypeFolder {
+		return "application/x-directory"
+	}
+
+	ext := strings.ToLower(path.Ext(entry.Name))
+
+	contentTypes := map[string]string{
+		".json": "application/json",
+		".xml":  "application/xml",
+		".txt":  contentTypeText,
+		".csv":  "text/csv",
+		".html": contentTypeHTML,
+		".htm":  contentTypeHTML,
+		".pdf":  "application/pdf",
+		".zip":  "application/zip",
+		".jpg":  contentTypeJPEG,
+		".jpeg": contentTypeJPEG,
+		".png":  "image/png",
+		".gif":  "image/gif",
+	}
+
+	if contentType, ok := contentTypes[ext]; ok {
+		return contentType
+	}
+
+	return contentTypeOctetStream
+}
+
+func safeUint64ToInt64(u uint64) int64 {
+	const maxInt64 = 1<<63 - 1
+
+	if u > maxInt64 {
+		return maxInt64
+	}
+
+	return int64(u)
+}

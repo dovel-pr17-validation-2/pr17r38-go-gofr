@@ -1,0 +1,209 @@
+package migration
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"gofr.dev/pkg/gofr/container"
+	"gofr.dev/pkg/gofr/testutil"
+)
+
+var errCassandraInner = errors.New("cassandra inner migrator error")
+
+func cassandraSetup(t *testing.T) (migrator, *container.MockCassandraWithContext, *container.Container) {
+	t.Helper()
+
+	mockContainer, mocks := container.NewMockContainer(t)
+
+	mockCassandra := mocks.Cassandra
+
+	ds := Datasource{Cassandra: mockContainer.Cassandra}
+
+	cassandraDB := cassandraDS{CassandraWithContext: mockCassandra}
+	migratorWithCassandra := cassandraDB.apply(&ds)
+
+	mockContainer.Cassandra = mockCassandra
+
+	return migratorWithCassandra, mockCassandra, mockContainer
+}
+
+func Test_CassandraCheckAndCreateMigrationTable(t *testing.T) {
+	migratorWithCassandra, mockCassandra, mockContainer := cassandraSetup(t)
+
+	testCases := []struct {
+		desc string
+		err  error
+	}{
+		{"no error", nil},
+		{"connection failed", sql.ErrConnDone},
+	}
+
+	for i, tc := range testCases {
+		mockCassandra.EXPECT().ExecWithCtx(gomock.Any(), checkAndCreateCassandraMigrationTable).Return(tc.err)
+
+		err := migratorWithCassandra.checkAndCreateMigrationTable(mockContainer)
+
+		assert.Equal(t, tc.err, err, "TEST[%v]\n %v Failed! ", i, tc.desc)
+	}
+}
+
+func Test_CassandraGetAppliedMigrations(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		versions    []int64
+		queryErr    error
+		baseApplied map[int64]struct{}
+		baseErr     error
+		expApplied  map[int64]struct{}
+		expErr      error
+	}{
+		{
+			desc:        "cassandra versions are unioned with inner migrator versions",
+			versions:    []int64{1, 3, 4},
+			baseApplied: map[int64]struct{}{2: {}},
+			expApplied:  map[int64]struct{}{1: {}, 2: {}, 3: {}, 4: {}},
+		},
+		{
+			desc:        "empty cassandra table returns only inner versions",
+			versions:    []int64{},
+			baseApplied: map[int64]struct{}{5: {}},
+			expApplied:  map[int64]struct{}{5: {}},
+		},
+		{
+			desc:     "cassandra query error",
+			queryErr: sql.ErrConnDone,
+			expErr:   sql.ErrConnDone,
+		},
+		{
+			desc:     "inner migrator error",
+			versions: []int64{2},
+			baseErr:  errCassandraInner,
+			expErr:   errCassandraInner,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockContainer, mocks := container.NewMockContainer(t)
+			mockMigrator := NewMockmigrator(ctrl)
+
+			m := cassandraMigrator{CassandraWithContext: mocks.Cassandra, migrator: mockMigrator}
+
+			mocks.Cassandra.EXPECT().QueryWithCtx(gomock.Any(), gomock.Any(), getCassandraGoFrMigrationVersions).
+				DoAndReturn(func(_ context.Context, dest any, _ string, _ ...any) error {
+					if tc.queryErr != nil {
+						return tc.queryErr
+					}
+
+					*(dest.(*[]int64)) = tc.versions
+
+					return nil
+				})
+
+			if tc.queryErr == nil {
+				mockMigrator.EXPECT().getAppliedMigrations(mockContainer).Return(tc.baseApplied, tc.baseErr)
+			}
+
+			applied, err := m.getAppliedMigrations(mockContainer)
+
+			assert.Equal(t, tc.expApplied, applied)
+
+			if tc.expErr != nil {
+				require.ErrorIs(t, err, tc.expErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_CassandraCommitMigration(t *testing.T) {
+	migratorWithCassandra, mockCassandra, mockContainer := cassandraSetup(t)
+
+	testCases := []struct {
+		desc string
+		err  error
+	}{
+		{"no error", nil},
+		{"connection failed", sql.ErrConnDone},
+	}
+
+	timeNow := time.Now()
+
+	td := transactionData{
+		StartTime:       timeNow,
+		MigrationNumber: 10,
+		UsedDatasources: map[string]bool{dsCassandra: true},
+	}
+
+	for i, tc := range testCases {
+		mockCassandra.EXPECT().ExecWithCtx(gomock.Any(), insertCassandraGoFrMigrationRow, td.MigrationNumber,
+			"UP", td.StartTime, gomock.Any()).Return(tc.err)
+
+		err := migratorWithCassandra.commitMigration(mockContainer, &td)
+
+		assert.Equal(t, tc.err, err, "TEST[%v]\n %v Failed! ", i, tc.desc)
+	}
+}
+
+func Test_CassandraBeginTransaction(t *testing.T) {
+	logs := testutil.StdoutOutputForFunc(func() {
+		migratorWithCassandra, _, mockContainer := cassandraSetup(t)
+		migratorWithCassandra.beginTransaction(mockContainer)
+	})
+
+	assert.Contains(t, logs, "cassandra migrator begin successfully")
+}
+
+func Test_CassandraCommitMigration_SkipsWhenNotUsed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockCass := container.NewMockCassandraWithContext(ctrl)
+	mockMigrator := NewMockmigrator(ctrl)
+	m := cassandraMigrator{CassandraWithContext: mockCass, migrator: mockMigrator}
+
+	c, _ := container.NewMockContainer(t)
+
+	data := transactionData{
+		MigrationNumber: 1,
+		StartTime:       time.Now(),
+		UsedDatasources: map[string]bool{},
+	}
+
+	mockMigrator.EXPECT().commitMigration(c, &data).Return(nil)
+
+	err := m.commitMigration(c, &data)
+	assert.NoError(t, err)
+}
+
+func Test_CassandraMigratorDelegation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	mockContainer, _ := container.NewMockContainer(t)
+	mockMigrator := NewMockmigrator(ctrl)
+	mockLogger := container.NewMockLogger(ctrl)
+	mockContainer.Logger = mockLogger
+
+	m := cassandraMigrator{migrator: mockMigrator}
+	data := transactionData{MigrationNumber: 4}
+
+	mockMigrator.EXPECT().rollback(mockContainer, &data)
+	mockLogger.EXPECT().Fatalf("migration %v failed and rolled back", int64(4))
+	mockMigrator.EXPECT().lock(gomock.Any(), gomock.Any(), mockContainer, "owner-1").Return(sql.ErrConnDone)
+	mockMigrator.EXPECT().unlock(mockContainer, "owner-1").Return(sql.ErrConnDone)
+
+	m.rollback(mockContainer, &data)
+
+	require.ErrorIs(t, m.lock(t.Context(), func() {}, mockContainer, "owner-1"), sql.ErrConnDone)
+	require.ErrorIs(t, m.unlock(mockContainer, "owner-1"), sql.ErrConnDone)
+	assert.Equal(t, "Cassandra", m.name())
+}

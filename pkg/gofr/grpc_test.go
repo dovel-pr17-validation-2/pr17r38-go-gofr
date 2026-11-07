@@ -1,0 +1,845 @@
+//go:build !gofr_nogrpc
+
+package gofr
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	"gofr.dev/pkg/gofr/config"
+	"gofr.dev/pkg/gofr/container"
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/testutil"
+)
+
+// nonExitingMockLogger embeds MockLogger but overrides Fatal methods to not exit.
+type nonExitingMockLogger struct {
+	*logging.MockLogger
+}
+
+func (n *nonExitingMockLogger) Fatal(args ...any) {
+	// Just log as error instead of exiting
+	n.MockLogger.Error(args...)
+}
+
+func (n *nonExitingMockLogger) Fatalf(format string, args ...any) {
+	// Just log as error instead of exiting
+	n.MockLogger.Errorf(format, args...)
+}
+
+// setupGRPCMetricExpectations sets up mock expectations for gRPC metrics.
+func setupGRPCMetricExpectations(mockMetrics *container.MockMetrics) {
+	mockMetrics.EXPECT().NewGauge("grpc_server_status", "gRPC server status (1=running, 0=stopped)").AnyTimes()
+	mockMetrics.EXPECT().NewCounter("grpc_server_errors_total", "Total gRPC server errors").AnyTimes()
+	mockMetrics.EXPECT().NewCounter("grpc_services_registered_total", "Total gRPC services registered").AnyTimes()
+	mockMetrics.EXPECT().NewCounter("app_grpc_rate_limit_exceeded_total", "Total gRPC requests rejected by rate limiter").AnyTimes()
+	mockMetrics.EXPECT().SetGauge("grpc_server_status", gomock.Any()).AnyTimes()
+	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "grpc_server_errors_total").AnyTimes()
+	mockMetrics.EXPECT().RecordHistogram(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+}
+
+// setupTestGRPCServer creates a mock container and gRPC server for testing.
+func setupTestGRPCServer(t *testing.T, port int, enableReflection bool) (*container.Container, *container.Mocks, *grpcServer) {
+	t.Helper()
+
+	c, mocks := container.NewMockContainer(t)
+	setupGRPCMetricExpectations(mocks.Metrics)
+
+	cfg := createMockGRPCConfig(t, port, enableReflection)
+	g, err := newGRPCServer(c, port, cfg)
+	require.NoError(t, err)
+
+	return c, mocks, g
+}
+
+// createTestInterceptors creates sample interceptors for testing.
+func createTestInterceptors() []grpc.UnaryServerInterceptor {
+	return []grpc.UnaryServerInterceptor{
+		func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			return handler(ctx, req)
+		},
+		func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			return handler(ctx, req)
+		},
+	}
+}
+
+//nolint:thelper // linter is suppressed to avoid SA5011 (possible nil pointer dereference) warnings from staticcheck
+func createMockGRPCConfig(t *testing.T, port int, enableReflection bool) config.Config {
+	// Use a default metrics port if t is nil (for cases where we don't need a real free port)
+	metricsPort := 8080
+	if t != nil {
+		metricsPort = testutil.GetFreePort(t)
+	}
+
+	configMap := map[string]string{
+		"GRPC_PORT":    strconv.Itoa(port),
+		"METRICS_PORT": strconv.Itoa(metricsPort),
+	}
+
+	if enableReflection {
+		configMap["GRPC_ENABLE_REFLECTION"] = "true"
+	} else {
+		configMap["GRPC_ENABLE_REFLECTION"] = "false"
+	}
+
+	return config.NewMockConfig(configMap)
+}
+
+func TestNewGRPCServer(t *testing.T) {
+	c, mocks, g := setupTestGRPCServer(t, 9999, false)
+
+	assert.NotNil(t, g, "TEST Failed.\n")
+	assert.NotNil(t, c, "Container should not be nil")
+	assert.NotNil(t, mocks, "Mocks should not be nil")
+}
+
+func TestGRPCServer_AddServerOptions(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	option1 := grpc.ConnectionTimeout(5 * time.Second)
+	option2 := grpc.MaxRecvMsgSize(1024 * 1024)
+
+	g.addServerOptions(option1, option2)
+
+	assert.Len(t, g.options, 2)
+}
+
+func TestGRPCServer_AddUnaryInterceptors(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	interceptors := createTestInterceptors()
+	g.addUnaryInterceptors(interceptors...)
+
+	assert.Len(t, g.interceptors, 4) // 2 default + 2 test interceptors
+}
+
+func TestGRPCServer_CreateServer(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	srv, err := g.ensureServer()
+	require.NoError(t, err)
+	assert.NotNil(t, srv)
+
+	// Second call must return the same server, not build another one.
+	again, err := g.ensureServer()
+	require.NoError(t, err)
+	assert.Same(t, srv, again)
+}
+
+func TestGRPCServer_RegisterService(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	srv, err := g.ensureServer()
+	require.NoError(t, err)
+
+	healthServer := health.NewServer()
+	desc := &grpc_health_v1.Health_ServiceDesc
+
+	srv.RegisterService(desc, healthServer)
+
+	services := srv.GetServiceInfo()
+	_, ok := services["grpc.health.v1.Health"]
+	assert.True(t, ok, "health service should be registered")
+}
+
+func TestGRPC_ServerRun(t *testing.T) {
+	// Test invalid port case
+	t.Run("net.Listen() error", func(t *testing.T) {
+		out := testutil.StderrOutputForFunc(func() {
+			c, mocks := container.NewMockContainer(t)
+			setupGRPCMetricExpectations(mocks.Metrics)
+
+			// Add expectations for error scenarios
+			mocks.Metrics.EXPECT().IncrementCounter(gomock.Any(), "grpc_server_errors_total").AnyTimes()
+			mocks.Metrics.EXPECT().SetGauge("grpc_server_status", gomock.Any()).AnyTimes()
+
+			cfg := createMockGRPCConfig(t, 99999, false) // Invalid port
+			g := &grpcServer{
+				port:   99999, // Invalid port
+				config: cfg,
+			}
+
+			// Create the server first
+			if _, err := g.ensureServer(); err != nil {
+				t.Fatalf("Failed to create server: %v", err)
+			}
+
+			// Run the server in a goroutine
+			done := make(chan bool)
+			serverRoutine := func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Logf("Server panicked: %v", r)
+					}
+
+					done <- true
+				}()
+
+				g.Run(c)
+			}
+
+			go serverRoutine()
+
+			// Give some time for the server to attempt startup
+			time.Sleep(500 * time.Millisecond)
+
+			// Shutdown the server
+			_ = g.Shutdown(t.Context())
+
+			// Wait for the goroutine to finish
+			<-done
+		})
+
+		// Assert that the expected log message was captured
+		assert.Contains(t, out, "error in starting gRPC server", "Expected log message not found for invalid port test")
+	})
+
+	// Test port occupied case
+	t.Run("server.Serve() error", func(t *testing.T) {
+		// First, occupy a port
+		occupiedPort := testutil.GetFreePort(t)
+		listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", fmt.Sprintf(":%d", occupiedPort))
+		require.NoError(t, err)
+
+		defer listener.Close()
+
+		out := testutil.StderrOutputForFunc(func() {
+			c, mocks := container.NewMockContainer(t)
+			setupGRPCMetricExpectations(mocks.Metrics)
+
+			// Add expectations for error scenarios
+			mocks.Metrics.EXPECT().IncrementCounter(gomock.Any(), "grpc_server_errors_total").AnyTimes()
+			mocks.Metrics.EXPECT().SetGauge("grpc_server_status", gomock.Any()).AnyTimes()
+
+			// Replace the logger with our custom logger that doesn't exit on Fatal
+			mockLogger := &nonExitingMockLogger{MockLogger: logging.NewMockLogger(logging.DEBUG).(*logging.MockLogger)}
+			c.Logger = mockLogger
+
+			cfg := createMockGRPCConfig(t, occupiedPort, false) // Use the occupied port
+			g := &grpcServer{
+				port:   occupiedPort, // Use the occupied port
+				config: cfg,
+			}
+
+			// Create the server first
+			if _, err := g.ensureServer(); err != nil {
+				t.Fatalf("Failed to create server: %v", err)
+			}
+
+			// Run the server - this should call Fatalf but not exit
+			g.Run(c)
+		})
+
+		// Assert that the expected log message was captured
+		assert.Contains(t, out, "gRPC port", "Expected log message not found for occupied port test")
+	})
+}
+
+func TestGRPC_ServerShutdown(t *testing.T) {
+	c, _, g := setupTestGRPCServer(t, 9999, false)
+
+	go g.Run(c)
+
+	// Wait for the server to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Create a context with a timeout to test the shutdown
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	err := g.Shutdown(ctx)
+	require.NoError(t, err, "TestGRPC_ServerShutdown Failed.\n")
+}
+
+func TestGRPC_ServerShutdown_ContextCanceled(t *testing.T) {
+	c, _, g := setupTestGRPCServer(t, 9999, false)
+
+	go g.Run(c)
+
+	// Wait for the server to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Create a context that can be canceled
+	ctx, cancel := context.WithCancel(t.Context())
+
+	errChan := make(chan error, 1)
+
+	go func() {
+		errChan <- g.Shutdown(ctx)
+	}()
+
+	// Cancel the context immediately
+	cancel()
+
+	err := <-errChan
+	require.ErrorContains(t, err, "context canceled", "Expected error due to context cancellation")
+}
+
+func Test_injectContainer_Fails(t *testing.T) {
+	// Case: container is an unaddressable or unexported field
+	type fail struct {
+		c1 *container.Container
+	}
+
+	c, _ := container.NewMockContainer(t)
+	srv1 := &fail{}
+	err := injectContainer(srv1, c)
+
+	require.ErrorIs(t, err, errNonAddressable)
+	require.Nil(t, srv1.c1)
+
+	// Case: server is passed as unaddressable(non-pointer)
+	srv3 := fail{}
+	out := testutil.StdoutOutputForFunc(func() {
+		cont, _ := container.NewMockContainer(t)
+		err = injectContainer(srv3, cont)
+
+		assert.NoError(t, err)
+	})
+
+	assert.Contains(t, out, "cannot inject container into non-addressable implementation of `fail`, consider using pointer")
+}
+
+func Test_injectContainer(t *testing.T) {
+	c, _ := container.NewMockContainer(t)
+
+	// embedded container
+	type success1 struct {
+		*container.Container
+	}
+
+	srv1 := &success1{}
+	err := injectContainer(srv1, c)
+
+	require.NoError(t, err)
+	require.NotNil(t, srv1.Container)
+
+	// pointer type container
+	type success2 struct {
+		C *container.Container
+	}
+
+	srv2 := &success2{}
+	err = injectContainer(srv2, c)
+
+	require.NoError(t, err)
+	require.NotNil(t, srv2.C)
+
+	// non pointer type container
+	type success3 struct {
+		C container.Container
+	}
+
+	srv3 := &success3{}
+	err = injectContainer(srv3, c)
+
+	require.NoError(t, err)
+	require.NotNil(t, srv3.C)
+}
+
+func TestGRPC_Shutdown_BeforeStart(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	err := g.Shutdown(ctx)
+	assert.NoError(t, err, "Expected shutdown to succeed even if server was not started")
+}
+
+// TestGRPC_Shutdown_BeforeStart_ContextCanceled guards against a regression where
+// the force-close path of Shutdown dereferences g.server without a nil check.
+// When no service has been registered, g.server is nil; if the shutdown context
+// is already done, ShutdownWithContext invokes the force-close func, which
+// previously panicked with a nil pointer dereference.
+func TestGRPC_Shutdown_BeforeStart_ContextCanceled(t *testing.T) {
+	_, _, g := setupTestGRPCServer(t, 9999, false)
+
+	require.Nil(t, g.server, "precondition: server should be nil before any service is registered")
+
+	// Loop to maximize chance of force-close path winning the select inside ShutdownWithContext.
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		assert.NotPanics(t, func() {
+			_ = g.Shutdown(ctx)
+		}, "Shutdown must not panic when server was never created")
+	}
+}
+
+// TestGRPC_ConcurrentRunAndShutdown guards against a regression of the data race the
+// srvMu guard closes: ensureServer publishes g.server from the serve goroutine while
+// Shutdown reads it on the caller's. Meaningful under -race; without the guard the
+// detector reports both the field itself and the CAS inside grpc-go's Server.Stop.
+func TestGRPC_ConcurrentRunAndShutdown(t *testing.T) {
+	c, _, g := setupTestGRPCServer(t, testutil.GetFreePort(t), false)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		g.Run(c)
+	}()
+
+	// No sleep: racing Shutdown against Run's publish of g.server is the point.
+	require.NoError(t, g.Shutdown(t.Context()))
+
+	// That Shutdown may legitimately have observed no server yet and returned a no-op —
+	// Run is free to publish afterwards and keep serving. That lost-shutdown gap is
+	// nil-check-as-started, tracked in #3801, and is deliberately not what this test
+	// asserts; stop whatever Run ended up publishing so Run returns either way.
+	require.Eventually(t, func() bool {
+		srv := g.getServer()
+		if srv == nil {
+			return false
+		}
+
+		srv.Stop()
+
+		return true
+	}, time.Second, 10*time.Millisecond, "Run never published a server to stop")
+
+	wg.Wait()
+}
+
+// TestGRPC_ConcurrentEnsureServer guards the check-then-act half: with the check and the publish
+// under one hold, concurrent callers all get the same server. Split across separate holds, two
+// callers can both observe nil and both build one — the loser then serves a server no getServer
+// returns and no Shutdown stops. The options length also pins the append inside ensureServer,
+// which the same hold covers.
+func TestGRPC_ConcurrentEnsureServer(t *testing.T) {
+	const callers = 8
+
+	_, _, g := setupTestGRPCServer(t, testutil.GetFreePort(t), false)
+
+	var (
+		wg      sync.WaitGroup
+		servers = make([]*grpc.Server, callers)
+		errs    = make([]error, callers)
+		start   = make(chan struct{})
+	)
+
+	for i := range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			<-start
+
+			servers[i], errs[i] = g.ensureServer()
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	for i := range callers {
+		require.NoError(t, errs[i])
+		require.NotNil(t, servers[i])
+		assert.Samef(t, servers[0], servers[i], "caller %d got a different server: two were created", i)
+	}
+
+	// Exactly one build happened: the unary and stream interceptor options, appended once.
+	assert.Len(t, g.options, 2)
+
+	servers[0].Stop()
+}
+
+func TestGRPC_ServerRun_WithInterceptorAndOptions(t *testing.T) {
+	freePort := testutil.GetFreePort(t)
+	c, _, g := setupTestGRPCServer(t, freePort, false)
+
+	var interceptorExecutions []string
+
+	// Define interceptors
+	interceptor1 := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		interceptorExecutions = append(interceptorExecutions, "interceptor1")
+		return handler(ctx, req)
+	}
+
+	interceptor2 := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		interceptorExecutions = append(interceptorExecutions, "interceptor2")
+		return handler(ctx, req)
+	}
+
+	app := New()
+	app.container = c
+	app.grpcServer = g
+
+	// Add the server options and interceptors to the app
+	app.AddGRPCServerOptions(
+		grpc.ConnectionTimeout(5*time.Second),
+		grpc.MaxRecvMsgSize(1024*1024))
+
+	// Set interceptors
+	app.AddGRPCUnaryInterceptors(interceptor1, interceptor2)
+
+	// Create the server first
+	srv, err := g.ensureServer()
+	require.NoError(t, err)
+
+	// Start the server in a goroutine
+	go g.Run(c)
+
+	// Wait for the server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Shutdown the server immediately to avoid timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+
+	defer cancel()
+
+	err = g.Shutdown(ctx)
+	require.NoError(t, err)
+
+	// Verify that the server was created with the interceptors and options
+	assert.NotNil(t, srv)
+	assert.Len(t, g.interceptors, 4) // 2 default + 2 test interceptors
+	assert.Len(t, g.options, 4)      // 2 test options + 2 default (interceptor) options
+}
+
+func TestApp_WithReflection(t *testing.T) {
+	c, _, g := setupTestGRPCServer(t, 9999, true) // Enable reflection
+
+	app := New()
+	app.container = c
+	app.grpcServer = g
+
+	srv, err := g.ensureServer()
+	require.NoError(t, err)
+
+	services := srv.GetServiceInfo()
+	_, ok := services["grpc.reflection.v1alpha.ServerReflection"]
+	assert.True(t, ok, "reflection service should be registered")
+}
+
+// injectableHealthService is a health service whose exported container field receives injection.
+type injectableHealthService struct {
+	grpc_health_v1.UnimplementedHealthServer
+	C *container.Container
+}
+
+// nonInjectableHealthService hides its container field, so injection fails.
+type nonInjectableHealthService struct {
+	grpc_health_v1.UnimplementedHealthServer
+	c *container.Container
+}
+
+func TestNewGRPCServer_InvalidPort(t *testing.T) {
+	tests := []struct {
+		desc string
+		port int
+	}{
+		{desc: "zero port", port: 0},
+		{desc: "negative port", port: -1},
+		{desc: "port above range", port: 65536},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			c, _ := container.NewMockContainer(t)
+
+			g, err := newGRPCServer(c, tc.port, config.NewMockConfig(nil))
+
+			require.ErrorIs(t, err, errInvalidPort)
+			assert.Nil(t, g)
+		})
+	}
+}
+
+func TestApp_AddGRPCServerOptionsAndInterceptors(t *testing.T) {
+	unary := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		return handler(ctx, req)
+	}
+
+	stream := func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return handler(srv, ss)
+	}
+
+	otherStream := func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return handler(srv, ss)
+	}
+
+	tests := []struct {
+		desc           string
+		call           func(a *App)
+		setupMocks     func(l *container.MockLogger)
+		expOptions     int
+		expUnary       int
+		expStreamCount int
+	}{
+		{
+			desc: "no server options",
+			call: func(a *App) { a.AddGRPCServerOptions() },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debug("no gRPC server options provided")
+			},
+			expOptions: 0, expUnary: 2, expStreamCount: 2,
+		},
+		{
+			desc: "server options added",
+			call: func(a *App) { a.AddGRPCServerOptions(grpc.MaxRecvMsgSize(1024)) },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debugf("adding %d gRPC server options", 1)
+			},
+			expOptions: 1, expUnary: 2, expStreamCount: 2,
+		},
+		{
+			desc: "no unary interceptors",
+			call: func(a *App) { a.AddGRPCUnaryInterceptors() },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debug("no unary interceptors provided")
+			},
+			expOptions: 0, expUnary: 2, expStreamCount: 2,
+		},
+		{
+			desc: "unary interceptors added",
+			call: func(a *App) { a.AddGRPCUnaryInterceptors(unary) },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debugf("adding %d valid unary interceptors", 1)
+			},
+			expOptions: 0, expUnary: 3, expStreamCount: 2,
+		},
+		{
+			desc: "no stream interceptors",
+			call: func(a *App) { a.AddGRPCServerStreamInterceptors() },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debug("no stream interceptors provided")
+			},
+			expOptions: 0, expUnary: 2, expStreamCount: 2,
+		},
+		{
+			desc: "stream interceptors added",
+			call: func(a *App) { a.AddGRPCServerStreamInterceptors(stream, otherStream) },
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Debugf("adding %d stream interceptors", 2)
+			},
+			expOptions: 0, expUnary: 2, expStreamCount: 4,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			c, _, g := setupTestGRPCServer(t, 9999, false)
+
+			logger := container.NewMockLogger(gomock.NewController(t))
+			tc.setupMocks(logger)
+			c.Logger = logger
+
+			a := &App{container: c, grpcServer: g}
+
+			tc.call(a)
+
+			assert.Len(t, g.options, tc.expOptions)
+			assert.Len(t, g.interceptors, tc.expUnary)
+			assert.Len(t, g.streamInterceptors, tc.expStreamCount)
+		})
+	}
+}
+
+func TestApp_RegisterService(t *testing.T) {
+	tests := []struct {
+		desc        string
+		impl        any
+		setupMocks  func(l *container.MockLogger)
+		injected    func(impl any) bool
+		expInjected bool
+	}{
+		{
+			desc: "service registered and container injected",
+			impl: &injectableHealthService{},
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Infof("registering gRPC Service: %s", "grpc.health.v1.Health")
+				l.EXPECT().Infof("successfully registered gRPC service: %s", "grpc.health.v1.Health")
+			},
+			injected:    func(impl any) bool { return impl.(*injectableHealthService).C != nil },
+			expInjected: true,
+		},
+		{
+			desc: "container injection failure is fatal",
+			impl: &nonInjectableHealthService{},
+			setupMocks: func(l *container.MockLogger) {
+				l.EXPECT().Infof("registering gRPC Service: %s", "grpc.health.v1.Health")
+				l.EXPECT().Error(errNonAddressable)
+				l.EXPECT().Fatalf("failed to inject container into gRPC service %s: %v", "grpc.health.v1.Health", errNonAddressable)
+				// A real Fatalf exits the process; the mocked one returns, so anything logged after it is not asserted.
+				l.EXPECT().Infof("successfully registered gRPC service: %s", "grpc.health.v1.Health").AnyTimes()
+			},
+			injected:    func(impl any) bool { return impl.(*nonInjectableHealthService).c != nil },
+			expInjected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			c, mocks, g := setupTestGRPCServer(t, 9999, false)
+			mocks.Metrics.EXPECT().IncrementCounter(gomock.Any(), "grpc_services_registered_total")
+
+			logger := container.NewMockLogger(gomock.NewController(t))
+			tc.setupMocks(logger)
+			c.Logger = logger
+
+			a := &App{container: c, grpcServer: g}
+
+			a.RegisterService(&grpc_health_v1.Health_ServiceDesc, tc.impl)
+
+			_, ok := g.getServer().GetServiceInfo()["grpc.health.v1.Health"]
+			assert.True(t, ok)
+			assert.Equal(t, tc.expInjected, tc.injected(tc.impl))
+		})
+	}
+}
+
+// Moved here from gofr_test.go when App.grpcServer became an interface: both
+// tests reach the concrete server, which exists only in this build.
+
+func TestUnifiedAuthenticationRegistration(t *testing.T) {
+	t.Setenv("METRICS_PORT", "0")
+	t.Setenv("HTTP_PORT", strconv.Itoa(testutil.GetFreePort(t)))
+
+	app := New()
+
+	// Enable various auth methods
+	require.NoError(t, app.EnableBasicAuth("user", "pass"))
+	app.EnableAPIKeyAuth("key1")
+	require.NoError(t, app.EnableOAuth("http://jwks", 3600))
+
+	// The router's middleware slice is not inspectable without reflection, but the
+	// gRPC interceptors are. Two are registered by default (recovery and
+	// observability), so the three Enable calls above must take the count to five.
+	// Asserting >= 2 -- as this did before the interceptors moved behind
+	// addGRPCInterceptors -- passes on the defaults alone and proves nothing.
+	assert.Len(t, app.grpcServer.interceptors, 5, "gRPC unary interceptors should be registered")
+	assert.Len(t, app.grpcServer.streamInterceptors, 5, "gRPC stream interceptors should be registered")
+}
+
+type incomingStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s incomingStream) Context() context.Context { return s.ctx }
+
+func TestEnableBasicAuth_EmptyCredentialsGRPCFailClosed(t *testing.T) {
+	t.Setenv("METRICS_PORT", "0")
+	t.Setenv("HTTP_PORT", strconv.Itoa(testutil.GetFreePort(t)))
+
+	app := New()
+
+	require.ErrorIs(t, app.EnableBasicAuth("", ""), errEmptyBasicAuthCredential)
+	require.Len(t, app.grpcServer.interceptors, defaultInterceptorCount+1)
+	require.Len(t, app.grpcServer.streamInterceptors, defaultInterceptorCount+1)
+
+	// "Og==" is base64 of ":", an empty username and password.
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.MD{"authorization": []string{"Basic Og=="}})
+
+	unary := app.grpcServer.interceptors[defaultInterceptorCount]
+	_, err := unary(ctx, nil, &grpc.UnaryServerInfo{}, func(context.Context, any) (any, error) {
+		t.Error("unary handler must not run")
+
+		return nil, nil
+	})
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+
+	stream := app.grpcServer.streamInterceptors[defaultInterceptorCount]
+	err = stream(nil, incomingStream{ctx: ctx}, &grpc.StreamServerInfo{}, func(any, grpc.ServerStream) error {
+		t.Error("stream handler must not run")
+
+		return nil
+	})
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestStartGRPCServer_Registered(t *testing.T) {
+	t.Setenv("METRICS_PORT", "0")
+	t.Setenv("HTTP_PORT", strconv.Itoa(testutil.GetFreePort(t)))
+	t.Setenv("GRPC_PORT", strconv.Itoa(testutil.GetFreePort(t)))
+
+	app := New()
+	app.grpcRegistered = true
+
+	wg := sync.WaitGroup{}
+
+	// startGRPCServer should add to WaitGroup and launch the server
+	app.startGRPCServer(&wg)
+
+	// Give it a moment to start then shut down
+	time.Sleep(50 * time.Millisecond)
+
+	// Read through getServer rather than the field: createServer publishes it from the serve
+	// goroutine, so an unguarded read here races that write.
+	if g := app.grpcServer; g != nil {
+		g.forceStop()
+	}
+
+	wg.Wait()
+}
+
+// TestGRPCSetters_NoServerIsANoOp pins the panic-to-log fix on every method that
+// reaches the gRPC server through App.
+//
+// newGRPCServer fails on an out-of-range GRPC_PORT and factory.go logs and
+// continues, so App runs on with no gRPC server at all. Before the nil guard these
+// setters dereferenced the field blind and took the process down in exactly that
+// case -- a config typo turning into a nil-pointer panic in the user's own setup
+// code. Four methods share the guard, so all four are asserted: a later edit is
+// as likely to reintroduce it in one of them as in the one that was reported.
+func TestGRPCSetters_NoServerIsANoOp(t *testing.T) {
+	// 99999 is out of range, so newGRPCServer returns an error and App is left
+	// without a server. This is the state the guard exists for.
+	t.Setenv("GRPC_PORT", "99999")
+	t.Setenv("METRICS_PORT", "0")
+
+	app := New()
+	app.container.Logger = logging.NewMockLogger(logging.ERROR)
+
+	require.Nil(t, app.grpcServer, "the premise: this app has no gRPC server to configure")
+
+	calls := map[string]func(){
+		"AddGRPCServerOptions": func() {
+			app.AddGRPCServerOptions(grpc.MaxRecvMsgSize(1 << 20))
+		},
+		"AddGRPCUnaryInterceptors": func() {
+			app.AddGRPCUnaryInterceptors(func(ctx context.Context, req any,
+				_ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				return handler(ctx, req)
+			})
+		},
+		"AddGRPCServerStreamInterceptors": func() {
+			app.AddGRPCServerStreamInterceptors(func(srv any, ss grpc.ServerStream,
+				_ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				return handler(srv, ss)
+			})
+		},
+		"RegisterService": func() {
+			app.RegisterService(&grpc.ServiceDesc{ServiceName: "test.Service"}, struct{}{})
+		},
+	}
+
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			assert.NotPanics(t, call, "%s must log and return when there is no server", name)
+		})
+	}
+}

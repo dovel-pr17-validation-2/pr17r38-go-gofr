@@ -1,0 +1,229 @@
+//go:build !gofr_nodgraph
+
+package migration
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/dgraph-io/dgo/v210/protos/api"
+
+	"gofr.dev/pkg/gofr/container"
+)
+
+var errInvalidDgraphTxn = errors.New("invalid Dgraph transaction")
+
+// dgraphTxn is the subset of the Dgraph transaction used to record migrations.
+// The value returned by Dgraph.NewTxn satisfies it at runtime.
+type dgraphTxn interface {
+	Mutate(ctx context.Context, mu *api.Mutation) (*api.Response, error)
+	Commit(ctx context.Context) error
+	Discard(ctx context.Context) error
+}
+
+// dgraphDS is the adapter struct that implements migration operations.
+type dgraphDS struct {
+	client DGraph
+}
+
+// dgraphMigrator struct implements the migrator interface.
+type dgraphMigrator struct {
+	dgraphDS
+	migrator
+}
+
+const (
+	// dgraphSchema defines the migration schema with fully qualified predicate names.
+	dgraphSchema = `
+		migrations.version: int @index(int) .
+		migrations.method: string .
+		migrations.start_time: datetime .
+		migrations.duration: int .
+		type Migration {
+			migrations.version
+			migrations.method
+			migrations.start_time
+			migrations.duration
+		}
+	`
+
+	// getMigrationVersionsQuery fetches the version of every applied migration.
+	// The version predicate is aliased to "version" so it decodes into the
+	// response struct below.
+	getMigrationVersionsQuery = `
+		{
+			migrations(func: type(Migration)) {
+				version: migrations.version
+			}
+		}
+	`
+)
+
+// apply creates a new dgraphMigrator.
+func (ds dgraphDS) apply(m migrator) migrator {
+	return dgraphMigrator{
+		dgraphDS: ds,
+		migrator: m,
+	}
+}
+
+// ApplySchema applies the given schema to DGraph. It takes a context and schema string as parameters
+// and returns an error if the schema application fails.
+func (ds dgraphDS) ApplySchema(ctx context.Context, schema string) error {
+	return ds.client.ApplySchema(ctx, schema)
+}
+
+// AddOrUpdateField adds a new field or updates an existing field in DGraph schema.
+// Parameters:
+//   - ctx: The context for the operation
+//   - fieldName: Name of the field to add or update
+//   - fieldType: Data type of the field
+//   - directives: Additional DGraph directives for the field
+//
+// Returns an error if the operation fails.
+func (ds dgraphDS) AddOrUpdateField(ctx context.Context, fieldName, fieldType, directives string) error {
+	return ds.client.AddOrUpdateField(ctx, fieldName, fieldType, directives)
+}
+
+// DropField removes a field from DGraph schema.
+// Parameters:
+//   - ctx: The context for the operation
+//   - fieldName: Name of the field to remove
+//
+// Returns an error if the field deletion fails.
+func (ds dgraphDS) DropField(ctx context.Context, fieldName string) error {
+	return ds.client.DropField(ctx, fieldName)
+}
+
+// checkAndCreateMigrationTable ensures migration schema exists.
+func (dm dgraphMigrator) checkAndCreateMigrationTable(c *container.Container) error {
+	err := dm.ApplySchema(context.Background(), dgraphSchema)
+	if err != nil {
+		c.Debug("Migration schema might already exist:", err)
+	}
+
+	return dm.migrator.checkAndCreateMigrationTable(c)
+}
+
+// getAppliedMigrations retrieves the versions of every applied migration.
+func (dm dgraphMigrator) getAppliedMigrations(c *container.Container) (map[int64]struct{}, error) {
+	var response struct {
+		Migrations []struct {
+			Version int64 `json:"version"`
+		} `json:"migrations"`
+	}
+
+	resp, err := c.DGraph.Query(context.Background(), getMigrationVersionsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("dgraph: %w", err)
+	}
+
+	// Query returns an *api.Response whose Json field holds the actual result.
+	if r, ok := resp.(*api.Response); ok && len(r.Json) > 0 {
+		if err = json.Unmarshal(r.Json, &response); err != nil {
+			return nil, fmt.Errorf("dgraph: %w", err)
+		}
+	}
+
+	applied, err := dm.migrator.getAppliedMigrations(c)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, m := range response.Migrations {
+		applied[m.Version] = struct{}{}
+	}
+
+	return applied, nil
+}
+
+// beginTransaction starts a new migration transaction.
+func (dm dgraphMigrator) beginTransaction(c *container.Container) transactionData {
+	data := dm.migrator.beginTransaction(c)
+
+	c.Debug("Dgraph migrator begin successfully")
+
+	return data
+}
+
+// commitMigration records the migration metadata in a Dgraph transaction so the
+// version record is committed atomically, then chains to the next migrator.
+func (dm dgraphMigrator) commitMigration(c *container.Container, data *transactionData) error {
+	if !data.UsedDatasources[dsDGraph] {
+		return dm.migrator.commitMigration(c, data)
+	}
+
+	payload := map[string]any{
+		"migrations": []map[string]any{
+			{
+				// dgraph.type must match the schema type so getAppliedMigrations
+				// (func: type(Migration)) can find this record on later runs.
+				"dgraph.type":           "Migration",
+				"migrations.version":    data.MigrationNumber,
+				"migrations.method":     migrationMethodUP,
+				"migrations.start_time": data.StartTime.Format(time.RFC3339),
+				"migrations.duration":   time.Since(data.StartTime).Milliseconds(),
+			},
+		},
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	// isNil also rejects a typed-nil txn, which would satisfy the assertion but
+	// panic on Discard.
+	tx, ok := c.DGraph.NewTxn().(dgraphTxn)
+	if !ok || isNil(tx) {
+		return errInvalidDgraphTxn
+	}
+
+	defer func() {
+		if discardErr := tx.Discard(ctx); discardErr != nil {
+			c.Errorf("dgraph: migration transaction discard failed: %v", discardErr)
+		}
+	}()
+
+	// The txn write bypasses Client.Mutate, so log duration and errors here to
+	// keep the migration record write observable.
+	start := time.Now()
+
+	if _, err = tx.Mutate(ctx, &api.Mutation{SetJson: jsonPayload}); err != nil {
+		c.Errorf("dgraph: migration %v mutation failed: %v", data.MigrationNumber, err)
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		c.Errorf("dgraph: migration %v commit failed: %v", data.MigrationNumber, err)
+		return err
+	}
+
+	c.Debugf("recorded migration %v in Dgraph in %v", data.MigrationNumber, time.Since(start))
+
+	return dm.migrator.commitMigration(c, data)
+}
+
+// rollback handles migration failure and rollback.
+func (dm dgraphMigrator) rollback(c *container.Container, data *transactionData) {
+	dm.migrator.rollback(c, data)
+
+	c.Fatalf("Migration %v failed and rolled back", data.MigrationNumber)
+}
+
+func (dm dgraphMigrator) lock(ctx context.Context, cancel context.CancelFunc, c *container.Container, ownerID string) error {
+	return dm.migrator.lock(ctx, cancel, c, ownerID)
+}
+
+func (dm dgraphMigrator) unlock(c *container.Container, ownerID string) error {
+	return dm.migrator.unlock(c, ownerID)
+}
+
+func (dgraphMigrator) name() string {
+	return "DGraph"
+}

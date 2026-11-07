@@ -1,0 +1,242 @@
+package migration
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"gofr.dev/pkg/gofr/container"
+)
+
+var errMongoLockRefreshFailed = errors.New("failed to refresh MongoDB lock: lock lost or stolen")
+
+type mongoDS struct {
+	container.Mongo
+}
+
+type mongoMigrator struct {
+	container.Mongo
+	migrator
+	testInterval time.Duration // Used for testing; if non-zero, overrides defaultRefresh
+}
+
+// apply initializes mongoMigrator using the Mongo interface.
+func (ds mongoDS) apply(m migrator) migrator {
+	return mongoMigrator{
+		Mongo:    ds.Mongo,
+		migrator: m,
+	}
+}
+
+const (
+	mongoMigrationCollection = "gofr_migrations"
+	mongoLockCollection      = "gofr_migration_locks"
+	mongoLockDocumentID      = "gofr_migrations_lock"
+
+	// Field names of the lock document.
+	mongoFieldID        = "_id"
+	mongoFieldLockedBy  = "lockedBy"
+	mongoFieldExpiresAt = "expiresAt"
+)
+
+func isMongoCollectionExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "namespaceexists")
+}
+
+// checkAndCreateMigrationTable initializes a MongoDB collection if it doesn't exist.
+func (mg mongoMigrator) checkAndCreateMigrationTable(c *container.Container) error {
+	err := mg.Mongo.CreateCollection(context.Background(), mongoMigrationCollection)
+
+	if err != nil && !isMongoCollectionExistsError(err) {
+		return err
+	}
+
+	err = mg.Mongo.CreateCollection(context.Background(), mongoLockCollection)
+	if err != nil && !isMongoCollectionExistsError(err) {
+		return err
+	}
+
+	return mg.migrator.checkAndCreateMigrationTable(c)
+}
+
+func (mg mongoMigrator) getAppliedMigrations(c *container.Container) (map[int64]struct{}, error) {
+	var migrations []struct {
+		Version int64 `bson:"version"`
+	}
+
+	filter := make(map[string]any)
+
+	err := mg.Mongo.Find(context.Background(), mongoMigrationCollection, filter, &migrations)
+	if err != nil {
+		return nil, fmt.Errorf("mongo: %w", err)
+	}
+
+	c.Debugf("MongoDB applied migrations fetched: %v", len(migrations))
+
+	applied, err := mg.migrator.getAppliedMigrations(c)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, migration := range migrations {
+		applied[migration.Version] = struct{}{}
+	}
+
+	return applied, nil
+}
+
+func (mg mongoMigrator) beginTransaction(c *container.Container) transactionData {
+	return mg.migrator.beginTransaction(c)
+}
+
+func (mg mongoMigrator) commitMigration(c *container.Container, data *transactionData) error {
+	if data.UsedDatasources[dsMongo] {
+		migrationDoc := map[string]any{
+			migrationFieldVersion:   data.MigrationNumber,
+			migrationFieldMethod:    migrationMethodUP,
+			migrationFieldStartTime: data.StartTime,
+			migrationFieldDuration:  time.Since(data.StartTime).Milliseconds(),
+		}
+
+		_, err := mg.Mongo.InsertOne(context.Background(), mongoMigrationCollection, migrationDoc)
+		if err != nil {
+			return err
+		}
+
+		c.Debugf("Inserted record for migration %v in MongoDB gofr_migrations collection", data.MigrationNumber)
+	}
+
+	return mg.migrator.commitMigration(c, data)
+}
+
+func (mg mongoMigrator) rollback(c *container.Container, data *transactionData) {
+	mg.migrator.rollback(c, data)
+	c.Fatalf("Migration %v failed.", data.MigrationNumber)
+}
+
+func (mg mongoMigrator) startRefresh(ctx context.Context, cancel context.CancelFunc, c *container.Container, ownerID string) {
+	interval := defaultRefresh
+	if mg.testInterval > 0 {
+		interval = mg.testInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+
+			filter := map[string]any{
+				mongoFieldID:       mongoLockDocumentID,
+				mongoFieldLockedBy: ownerID,
+			}
+
+			update := map[string]any{
+				"$set": map[string]any{
+					"lockedAt":          now,
+					mongoFieldExpiresAt: now.Add(defaultLockTTL),
+				},
+			}
+
+			modified, err := mg.Mongo.UpdateMany(ctx, mongoLockCollection, filter, update)
+			if err != nil {
+				c.Errorf("failed to refresh mongo lock: %v", err)
+				cancel()
+
+				return
+			}
+
+			if modified == 0 {
+				c.Errorf("%v", errMongoLockRefreshFailed)
+				cancel()
+
+				return
+			}
+
+			c.Debug("Mongo lock refreshed successfully")
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (mg mongoMigrator) lock(ctx context.Context, cancel context.CancelFunc, c *container.Container, ownerID string) error {
+	for i := 0; ; i++ {
+		now := time.Now()
+
+		staleFilter := map[string]any{
+			mongoFieldID: mongoLockDocumentID,
+			mongoFieldExpiresAt: map[string]any{
+				"$lte": now,
+			},
+		}
+
+		if _, err := mg.Mongo.DeleteOne(ctx, mongoLockCollection, staleFilter); err != nil {
+			c.Errorf("failed to cleanup stale MongoDB lock: %v", err)
+		}
+
+		lockDoc := map[string]any{
+			mongoFieldID:        mongoLockDocumentID,
+			"lockedAt":          now,
+			mongoFieldLockedBy:  ownerID,
+			mongoFieldExpiresAt: now.Add(defaultLockTTL),
+		}
+
+		_, err := mg.Mongo.InsertOne(ctx, mongoLockCollection, lockDoc)
+		if err == nil {
+			c.Debug("Mongo lock acquired successfully")
+
+			go mg.startRefresh(ctx, cancel, c, ownerID)
+
+			return mg.migrator.lock(ctx, cancel, c, ownerID)
+		}
+
+		if !isDuplicateKeyError(err) {
+			c.Errorf("error while acquiring mongodb lock: %v", err)
+
+			return errLockAcquisitionFailed
+		}
+
+		c.Debugf("MongoDB lock already held, retrying in %v... (attempt %d)", defaultRetry, i+1)
+
+		select {
+		case <-time.After(defaultRetry):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (mg mongoMigrator) unlock(c *container.Container, ownerID string) error {
+	deleted, err := mg.Mongo.DeleteOne(context.Background(), mongoLockCollection, map[string]any{
+		mongoFieldID:       mongoLockDocumentID,
+		mongoFieldLockedBy: ownerID,
+	})
+	if err != nil {
+		c.Errorf("unable to release MongoDB lock: %v", err)
+		return errLockReleaseFailed
+	}
+
+	if deleted == 0 {
+		c.Errorf("failed to release MongoDB lock: lock already released or owned by another instance")
+		return errLockReleaseFailed
+	}
+
+	c.Debug("Mongo lock released successfully")
+
+	return mg.migrator.unlock(c, ownerID)
+}
+
+func (mongoMigrator) name() string {
+	return "Mongo"
+}

@@ -1,0 +1,458 @@
+package logging
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/term"
+
+	"gofr.dev/pkg/gofr/version"
+)
+
+const fileMode = 0644
+
+// PrettyPrint defines an interface for objects that can render
+// themselves in a human-readable format to the provided writer.
+type PrettyPrint interface {
+	PrettyPrint(writer io.Writer)
+}
+
+// Logger defines the interface for structured logging across
+// different log levels such as Debug, Info, Warn, Error, and Fatal.
+// It allows formatted logs and log level control.
+type Logger interface {
+	Debug(args ...any)
+	Debugf(format string, args ...any)
+	Log(args ...any)
+	Logf(format string, args ...any)
+	Info(args ...any)
+	Infof(format string, args ...any)
+	Notice(args ...any)
+	Noticef(format string, args ...any)
+	Warn(args ...any)
+	Warnf(format string, args ...any)
+	Error(args ...any)
+	Errorf(format string, args ...any)
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+	ChangeLevel(level Level)
+}
+
+type logger struct {
+	// level is atomic because ChangeLevel is called from the remote logger's
+	// polling goroutine while requests read it -- logf on every log call, and
+	// LogEnabled once per request. An atomic load is a plain load on every
+	// architecture GoFr targets, so this costs nothing the unsynchronized read
+	// did not, and closes the race the two readers would otherwise report.
+	level      atomic.Int64
+	normalOut  io.Writer
+	errorOut   io.Writer
+	isTerminal bool
+	lock       chan struct{}
+	file       *os.File
+}
+
+type logEntry struct {
+	Level       Level     `json:"level"`
+	Time        time.Time `json:"time"`
+	Message     any       `json:"message"`
+	TraceID     string    `json:"trace_id,omitempty"`
+	GofrVersion string    `json:"gofrVersion"`
+}
+
+// enabled reports whether an entry written at level survives the configured
+// level. It is the single definition of the gate: logf consults it before
+// building an entry, and LogEnabled exposes it so a caller that must ASSEMBLE
+// an entry can ask the same question first. Keeping one predicate is what stops
+// the two from drifting apart and silently dropping entries logf would emit.
+func (l *logger) enabled(level Level) bool {
+	return level >= Level(l.level.Load())
+}
+
+func (l *logger) logf(level Level, format string, args ...any) {
+	if !l.enabled(level) {
+		return
+	}
+
+	out := l.normalOut
+	if level >= ERROR {
+		out = l.errorOut
+	}
+
+	entry := logEntry{
+		Level:       level,
+		Time:        time.Now(),
+		GofrVersion: version.Framework,
+	}
+
+	traceID, filteredArgs := extractTraceIDAndFilterArgs(args)
+	entry.TraceID = traceID
+
+	switch {
+	case len(filteredArgs) == 1 && format == "":
+		entry.Message = filteredArgs[0]
+	case len(filteredArgs) != 1 && format == "":
+		entry.Message = filteredArgs
+	case format != "":
+		entry.Message = fmt.Sprintf(format, filteredArgs...)
+	}
+
+	if l.isTerminal {
+		l.prettyPrint(&entry, out)
+
+		return
+	}
+
+	l.encodeJSON(&entry, out)
+}
+
+// encodeJSON writes one entry as JSON.
+//
+// The entry is taken by pointer so that logf and logEntry can share this without
+// copying the struct at the call. That is a readability choice, not a saving:
+// &entry escapes into Encode's any exactly as a boxed copy would, and the
+// allocation count is identical either way -- measured at 4 for Log and 6 for
+// Infof, before and after. encoding/json produces the same bytes for both.
+func (*logger) encodeJSON(entry *logEntry, out io.Writer) {
+	_ = json.NewEncoder(out).Encode(entry)
+}
+
+func (l *logger) Debug(args ...any) {
+	l.logf(DEBUG, "", args...)
+}
+
+func (l *logger) Debugf(format string, args ...any) {
+	l.logf(DEBUG, format, args...)
+}
+
+func (l *logger) Info(args ...any) {
+	l.logf(INFO, "", args...)
+}
+
+func (l *logger) Infof(format string, args ...any) {
+	l.logf(INFO, format, args...)
+}
+
+func (l *logger) Notice(args ...any) {
+	l.logf(NOTICE, "", args...)
+}
+
+func (l *logger) Noticef(format string, args ...any) {
+	l.logf(NOTICE, format, args...)
+}
+
+func (l *logger) Warn(args ...any) {
+	l.logf(WARN, "", args...)
+}
+
+func (l *logger) Warnf(format string, args ...any) {
+	l.logf(WARN, format, args...)
+}
+
+func (l *logger) Log(args ...any) {
+	l.logf(INFO, "", args...)
+}
+
+// LogEnabled reports whether an entry written through Log would be emitted at
+// the configured level. Log writes at INFO, so this answers for INFO.
+//
+// It lets a caller that must BUILD an entry before logging it -- the request
+// logger assembles a struct, formats a timestamp and resolves the client IP --
+// skip that work when the entry would be discarded. Callers that already have
+// their arguments to hand gain nothing from it and should just call Log.
+//
+// Note the reach: the default level is INFO (GetLevelFromString("") returns it),
+// and INFO passes its own gate, so this returns true on a service that has not
+// raised LOG_LEVEL. It returns false only from NOTICE upward.
+func (l *logger) LogEnabled() bool {
+	return l.enabled(INFO)
+}
+
+// LogEntry logs a single pre-built value at INFO without the slice a variadic
+// call allocates.
+//
+// Log takes ...any, so Log(x) allocates a one-element []any on every call. On a
+// server that logs every request that is an allocation per request, for a slice
+// whose only purpose is to be unwrapped again immediately. This is the same
+// entry, the same level and byte-identical output; only the boxing is gone.
+//
+// It is deliberately NOT part of the exported Logger interface -- adding a method
+// there would break every external implementation. Callers reach it through an
+// optional interface assertion, exactly as LogEnabled is reached, so a logger
+// that does not provide it keeps working unchanged.
+//
+// The contract is narrower than the signature suggests: entry is taken as one
+// already-built message and is NOT put through the trace-marker extraction and
+// argument filtering Log performs. Passing a traceIDMarker, or a map[string]any
+// carrying the marker key, therefore produces different output from Log -- the
+// top-level trace_id field is not populated and the marker is not filtered out
+// of the message. Pass a plain entry value, as the request logger does; anything
+// that depends on marker handling must go through Log.
+func (l *logger) LogEntry(entry any) {
+	l.logEntry(INFO, entry)
+}
+
+// ErrorEntry is LogEntry at ERROR.
+func (l *logger) ErrorEntry(entry any) {
+	l.logEntry(ERROR, entry)
+}
+
+// logEntry builds and emits an entry from a single already-boxed message,
+// skipping the variadic path's slice allocation and its trace-ID scan.
+func (l *logger) logEntry(level Level, msg any) {
+	if !l.enabled(level) {
+		return
+	}
+
+	out := l.normalOut
+	if level >= ERROR {
+		out = l.errorOut
+	}
+
+	entry := logEntry{
+		Level:       level,
+		Time:        time.Now(),
+		Message:     msg,
+		GofrVersion: version.Framework,
+	}
+
+	if l.isTerminal {
+		l.prettyPrint(&entry, out)
+
+		return
+	}
+
+	l.encodeJSON(&entry, out)
+}
+
+func (l *logger) Logf(format string, args ...any) {
+	l.logf(INFO, format, args...)
+}
+
+func (l *logger) Error(args ...any) {
+	l.logf(ERROR, "", args...)
+}
+
+func (l *logger) Errorf(format string, args ...any) {
+	l.logf(ERROR, format, args...)
+}
+
+func (l *logger) Fatal(args ...any) {
+	l.logf(FATAL, "", args...)
+
+	// Flush output before exiting
+	if l.file != nil {
+		_ = l.file.Sync() // Ignore sync error as we're about to exit
+	}
+
+	//nolint:revive // exit status is 1 as it denotes failure as signified by Fatal log
+	os.Exit(1)
+}
+
+func (l *logger) Fatalf(format string, args ...any) {
+	l.logf(FATAL, format, args...)
+
+	// Flush output before exiting
+	if l.file != nil {
+		_ = l.file.Sync() // Ignore sync error as we're about to exit
+	}
+
+	//nolint:revive // exit status is 1 as it denotes failure as signified by Fatal log
+	os.Exit(1)
+}
+
+func (l *logger) prettyPrint(e *logEntry, out io.Writer) {
+	// Note: we need to lock the pretty print as printing to standard output not concurrency safe
+	// the logs when printed in go routines were getting misaligned since we are achieving
+	// a single line of log, in 2 separate statements which caused the misalignment.
+	l.lock <- struct{}{} // Acquire the channel's lock
+
+	defer func() {
+		<-l.lock // Release the channel's token
+	}()
+
+	// Pretty printing if the message interface defines a method PrettyPrint else print the log message
+	// This decouples the logger implementation from its usage
+	fmt.Fprintf(out, "\u001B[38;5;%dm%s\u001B[0m [%s]", e.Level.color(), e.Level.String()[0:4], e.Time.Format(time.TimeOnly))
+
+	if e.TraceID != "" {
+		fmt.Fprintf(out, " \u001B[38;5;8m%s\u001B[0m", e.TraceID)
+	}
+
+	fmt.Fprint(out, " ")
+
+	// Print the message
+	if fn, ok := e.Message.(PrettyPrint); ok {
+		fn.PrettyPrint(out)
+	} else {
+		fmt.Fprintf(out, "%v\n", e.Message)
+	}
+}
+
+// NewLogger creates a new Logger instance configured with the given log level.
+// Logs will be printed to stdout and stderr depending on the level.
+func NewLogger(level Level) Logger {
+	l := &logger{
+		normalOut: os.Stdout,
+		errorOut:  os.Stderr,
+		lock:      make(chan struct{}, 1),
+	}
+
+	l.level.Store(int64(level))
+
+	l.isTerminal = checkIfTerminal(l.normalOut)
+
+	return l
+}
+
+// NewFileLogger creates a new Logger instance that writes logs to the specified file.
+// If the file cannot be opened or created, logs are discarded.
+func NewFileLogger(path string) Logger {
+	l := &logger{
+		normalOut: io.Discard,
+		errorOut:  io.Discard,
+	}
+
+	if path == "" {
+		return l
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+	if err != nil {
+		return l
+	}
+
+	l.normalOut = f
+	l.errorOut = f
+	l.file = f
+
+	return l
+}
+
+func (l *logger) Close() error {
+	if l.file != nil {
+		return l.file.Close()
+	}
+
+	return nil
+}
+
+func checkIfTerminal(w io.Writer) bool {
+	// Force JSON output in test environments
+	if os.Getenv("GOFR_EXITER") == "1" {
+		return false
+	}
+
+	switch v := w.(type) {
+	case *os.File:
+		return term.IsTerminal(int(v.Fd()))
+	default:
+		return false
+	}
+}
+
+// ChangeLevel changes the log level of the logger.
+// This allows dynamic adjustment of the logging verbosity.
+func (l *logger) ChangeLevel(level Level) {
+	l.level.Store(int64(level))
+}
+
+// LogLevelResponder provides a method to get the log level.
+type LogLevelResponder interface {
+	LogLevel() Level
+}
+
+// GetLogLevelForError extracts the log level from an error if it implements LogLevelResponder.
+// If the error does not implement this interface, it defaults to ERROR level.
+// This is useful for determining the appropriate log level when handling errors.
+func GetLogLevelForError(err error) Level {
+	level := ERROR
+
+	if e, ok := err.(LogLevelResponder); ok {
+		level = e.LogLevel()
+	}
+
+	return level
+}
+
+// traceIDMarkerKey is the map key under which ContextLogger smuggles a trace ID
+// through the log args for extractTraceIDAndFilterArgs to lift out here. It is
+// an internal producer/consumer contract within this package (asserted by the
+// logging tests); the marker is stripped before formatting and never reaches
+// the wire, so the exact key only needs to stay consistent between the two.
+const traceIDMarkerKey = "__trace_id__"
+
+// traceIDMarker is the cheaper carrier for the same contract. A one-entry
+// map[string]any costs two allocations (the header and its bucket); a named
+// string costs one when boxed into any.
+//
+// The map form remains accepted because it is a cross-package contract:
+// pkg/gofr/ai/instrument.go emits map[string]any{"__trace_id__": traceID} on
+// every instrumented LLM call, and it cannot use this type because traceIDMarker
+// is unexported. So this is an additional shape, not a replacement -- both
+// branches of extractTraceIDAndFilterArgs and hasTraceMarker must stay.
+type traceIDMarker string
+
+// extractTraceIDAndFilterArgs checks if any of the arguments contain a trace ID
+// under the key "__trace_id__" and returns the extracted trace ID along with
+// the remaining arguments excluding the trace metadata.
+func extractTraceIDAndFilterArgs(args []any) (traceID string, filtered []any) {
+	// Fast path: the vast majority of log calls carry no trace-ID marker
+	// (framework logs, the per-request access log, plain user logs). Detect
+	// that with a read-only scan and return the args slice untouched — no
+	// allocation. Only when a marker is actually present do we pay for the
+	// filtered copy below.
+	if !hasTraceMarker(args) {
+		return "", args
+	}
+
+	filtered = make([]any, 0, len(args))
+
+	for _, arg := range args {
+		if tid, ok := arg.(traceIDMarker); ok {
+			if traceID == "" {
+				traceID = string(tid)
+			}
+
+			continue
+		}
+
+		if m, ok := arg.(map[string]any); ok {
+			if tid, exists := m[traceIDMarkerKey].(string); exists {
+				if traceID == "" {
+					traceID = tid
+				}
+
+				continue
+			}
+		}
+
+		filtered = append(filtered, arg)
+	}
+
+	return traceID, filtered
+}
+
+// hasTraceMarker reports whether any arg is a trace-ID marker -- either the
+// typed traceIDMarker that ContextLogger emits, or the map[string]any carrying
+// the "__trace_id__" key that pkg/gofr/ai emits. Read-only: it allocates
+// nothing.
+func hasTraceMarker(args []any) bool {
+	for _, arg := range args {
+		if _, ok := arg.(traceIDMarker); ok {
+			return true
+		}
+
+		if m, ok := arg.(map[string]any); ok {
+			if _, exists := m[traceIDMarkerKey]; exists {
+				return true
+			}
+		}
+	}
+
+	return false
+}

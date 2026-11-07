@@ -1,0 +1,434 @@
+// Package sql provides functionalities to interact with SQL databases using the database/sql package.This package
+// includes a wrapper around sql.DB and sql.Tx to provide additional features such as query logging, metrics recording,
+// and error handling.
+package sql
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"gofr.dev/pkg/gofr/datasource"
+)
+
+// DB is a wrapper around sql.DB which provides some more features.
+type DB struct {
+	// contains unexported or private fields
+	*sql.DB
+	logger     datasource.Logger
+	config     *DBConfig
+	metrics    Metrics
+	stopSignal chan struct{}
+	closeOnce  sync.Once
+	// background tracks the retry and metrics goroutines so Close can wait for
+	// them; cancelBackground aborts the retry goroutine's in-flight ping. Both are
+	// set by finalizeConnection; a DB not built through it starts no background
+	// goroutines, so Close has nothing to wait for.
+	background       sync.WaitGroup
+	cancelBackground context.CancelFunc
+	// cleanup, when non-nil, tears down resources owned by the datasource that
+	// database/sql does not close itself — e.g. the Cloud SQL connector's dialer
+	// and its background credential refresh. It is set by NewSQLFromConnector and
+	// run once on Close.
+	cleanup func() error
+}
+
+type Log struct {
+	Type     string `json:"type"`
+	Query    string `json:"query"`
+	Duration int64  `json:"duration"`
+	Args     []any  `json:"args,omitempty"`
+}
+
+func (l *Log) PrettyPrint(writer io.Writer) {
+	fmt.Fprintf(writer, "\u001B[38;5;8m%-32s \u001B[38;5;24m%-6s\u001B[0m %8d\u001B[38;5;8mµs\u001B[0m %s\n",
+		l.Type, "SQL", l.Duration, clean(l.Query))
+}
+
+func clean(query string) string {
+	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
+	query = strings.TrimSpace(query)
+
+	return query
+}
+
+func sendStats(logger datasource.Logger, metrics Metrics, config *DBConfig, start time.Time, queryType, query string, args ...any) {
+	duration := time.Since(start)
+
+	if logger != nil {
+		if config != nil && config.hideArgs {
+			args = maskArgs(args)
+		}
+
+		logger.Debug(&Log{
+			Type:     queryType,
+			Query:    query,
+			Duration: duration.Microseconds(),
+			Args:     args,
+		})
+	}
+
+	// This contains the fix for the nil pointer dereference
+	if metrics != nil {
+		metrics.RecordHistogram(context.Background(), "app_sql_stats",
+			float64(duration)/float64(time.Millisecond), "hostname", config.HostName,
+			"database", config.Database, "type", getOperationType(query))
+	}
+}
+
+// maskArgs replaces every argument with a fixed mask, keeping the count visible.
+func maskArgs(args []any) []any {
+	if len(args) == 0 {
+		return args
+	}
+
+	masked := make([]any, len(args))
+	for i := range masked {
+		masked[i] = redactedPassword
+	}
+
+	return masked
+}
+
+func (d *DB) sendOperationStats(start time.Time, queryType, query string, args ...any) {
+	sendStats(d.logger, d.metrics, d.config, start, queryType, query, args...)
+}
+
+func getOperationType(query string) string {
+	query = strings.TrimSpace(query)
+	words := strings.Split(query, " ")
+
+	return strings.ToUpper(words[0])
+}
+
+func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	defer d.sendOperationStats(time.Now(), "Query", query, args...)
+	return d.DB.QueryContext(context.Background(), query, args...)
+}
+
+func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	defer d.sendOperationStats(time.Now(), "QueryContext", query, args...)
+	return d.DB.QueryContext(ctx, query, args...)
+}
+
+func (d *DB) Dialect() string {
+	return d.config.Dialect
+}
+
+func (d *DB) QueryRow(query string, args ...any) *sql.Row {
+	defer d.sendOperationStats(time.Now(), "QueryRow", query, args...)
+	return d.DB.QueryRowContext(context.Background(), query, args...)
+}
+
+func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	defer d.sendOperationStats(time.Now(), "QueryRowContext", query, args...)
+	return d.DB.QueryRowContext(ctx, query, args...)
+}
+
+func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
+	defer d.sendOperationStats(time.Now(), "Exec", query, args...)
+	return d.DB.ExecContext(context.Background(), query, args...)
+}
+
+func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	defer d.sendOperationStats(time.Now(), "ExecContext", query, args...)
+	return d.DB.ExecContext(ctx, query, args...)
+}
+
+func (d *DB) Prepare(query string) (*sql.Stmt, error) {
+	defer d.sendOperationStats(time.Now(), "Prepare", query)
+	return d.DB.PrepareContext(context.Background(), query)
+}
+
+func (d *DB) Begin() (*Tx, error) {
+	tx, err := d.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Tx{Tx: tx, config: d.config, logger: d.logger, metrics: d.metrics}, nil
+}
+
+// Close stops the background connection-retry and metrics goroutines, waits for
+// them to exit, then closes the pool and runs the datasource cleanup. An in-flight
+// background ping is canceled, but a driver may ignore cancellation while connecting
+// (lib/pq does), so the wait is bounded by closeWaitTimeout: Close always returns
+// within it, logging a warning if a background connection attempt did not stop, and
+// closes the pool regardless. That attempt then fails on the closed pool and exits.
+// Only the first Close waits; a later one returns without waiting again.
+func (d *DB) Close() error {
+	d.closeOnce.Do(func() {
+		close(d.stopSignal)
+
+		if d.cancelBackground != nil {
+			d.cancelBackground()
+		}
+
+		d.waitForBackground()
+	})
+
+	var err error
+
+	if d.DB != nil {
+		err = d.DB.Close()
+	}
+
+	// Run any datasource-owned teardown (e.g. the Cloud SQL connector's dialer)
+	// after closing the pool, joining its error so neither is masked.
+	if d.cleanup != nil {
+		cleanup := d.cleanup
+		d.cleanup = nil
+		err = errors.Join(err, cleanup())
+	}
+
+	return err
+}
+
+// closeWaitTimeout bounds how long Close waits for the background goroutines. It is
+// a variable so tests can lower it.
+//
+//nolint:gochecknoglobals // overridden by tests only.
+var closeWaitTimeout = 5 * time.Second
+
+// waitForBackground waits for the background goroutines, giving up after
+// closeWaitTimeout so a driver that ignores context cancellation cannot hang Close.
+func (d *DB) waitForBackground() {
+	done := make(chan struct{})
+
+	go func() {
+		d.background.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(closeWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+		if d.logger != nil {
+			d.logger.Warnf("closing SQL database after %s: a background connection attempt did not stop, "+
+				"its driver is not honoring context cancellation", closeWaitTimeout)
+		}
+	}
+}
+
+type Tx struct {
+	*sql.Tx
+	config  *DBConfig
+	logger  datasource.Logger
+	metrics Metrics
+}
+
+func (t *Tx) sendOperationStats(start time.Time, queryType, query string, args ...any) {
+	sendStats(t.logger, t.metrics, t.config, start, queryType, query, args...)
+}
+
+func (t *Tx) Query(query string, args ...any) (*sql.Rows, error) {
+	defer t.sendOperationStats(time.Now(), "TxQuery", query, args...)
+	return t.Tx.QueryContext(context.Background(), query, args...)
+}
+
+func (t *Tx) QueryRow(query string, args ...any) *sql.Row {
+	defer t.sendOperationStats(time.Now(), "TxQueryRow", query, args...)
+	return t.Tx.QueryRowContext(context.Background(), query, args...)
+}
+
+func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	defer t.sendOperationStats(time.Now(), "TxQueryRowContext", query, args...)
+	return t.Tx.QueryRowContext(ctx, query, args...)
+}
+
+func (t *Tx) Exec(query string, args ...any) (sql.Result, error) {
+	defer t.sendOperationStats(time.Now(), "TxExec", query, args...)
+	return t.Tx.ExecContext(context.Background(), query, args...)
+}
+
+func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	defer t.sendOperationStats(time.Now(), "TxExecContext", query, args...)
+	return t.Tx.ExecContext(ctx, query, args...)
+}
+
+func (t *Tx) Prepare(query string) (*sql.Stmt, error) {
+	defer t.sendOperationStats(time.Now(), "TxPrepare", query)
+	return t.Tx.PrepareContext(context.Background(), query)
+}
+
+func (t *Tx) Commit() error {
+	defer t.sendOperationStats(time.Now(), "TxCommit", "COMMIT")
+	return t.Tx.Commit()
+}
+
+func (t *Tx) Rollback() error {
+	defer t.sendOperationStats(time.Now(), "TxRollback", "ROLLBACK")
+	return t.Tx.Rollback()
+}
+
+// Select runs a query with args and binds the result of the query to the data.
+// data should be a point to a slice, struct or any type. Slice will return multiple
+// objects whereas struct will return a single object.
+//
+// Example Usages:
+//
+//  1. Get multiple rows with only one column
+//     ids := make([]int, 0)
+//     db.Select(ctx, &ids, "select id from users")
+//
+//  2. Get a single object from database
+//     type user struct {
+//     Name  string
+//     ID    int
+//     Image string
+//     }
+//     u := user{}
+//     db.Select(ctx, &u, "select * from users where id=?", 1)
+//
+//  3. Get array of objects from multiple rows
+//     type user struct {
+//     Name  string
+//     ID    int
+//     Image string `db:"image_url"`
+//     }
+//     users := []user{}
+//     db.Select(ctx, &users, "select * from users")
+//
+//nolint:exhaustive // We just want to take care of slice and struct in this case.
+func (d *DB) Select(ctx context.Context, data any, query string, args ...any) {
+	// If context is done, it is not needed
+	if ctx.Err() != nil {
+		return
+	}
+
+	// First confirm that what we got in v is a pointer else it won't be settable
+	rvo := reflect.ValueOf(data)
+	if rvo.Kind() != reflect.Pointer {
+		d.logger.Error("we did not get a pointer. data is not settable.")
+		return
+	}
+
+	// Deference the pointer to the underlying element, if the underlying element is a slice, multiple rows are expected.
+	// If the underlying element is a struct, one row is expected.
+	rv := rvo.Elem()
+
+	switch rv.Kind() {
+	case reflect.Slice:
+		d.selectSlice(ctx, query, args, rvo, rv)
+
+	case reflect.Struct:
+		d.selectStruct(ctx, query, args, rv)
+
+	default:
+		d.logger.Debugf("a pointer to %v was not expected.", rv.Kind().String())
+	}
+}
+
+func (d *DB) selectSlice(ctx context.Context, query string, args []any, rvo, rv reflect.Value) {
+	rows, err := d.QueryContext(ctx, query, args...)
+	if err != nil {
+		d.logger.Errorf("error running query: %v", err)
+		return
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		val := reflect.New(rv.Type().Elem())
+
+		if rv.Type().Elem().Kind() == reflect.Struct {
+			d.rowsToStruct(rows, val)
+		} else {
+			_ = rows.Scan(val.Interface())
+		}
+
+		rv = reflect.Append(rv, val.Elem())
+	}
+
+	if rows.Err() != nil {
+		d.logger.Errorf("error parsing rows : %v", rows.Err())
+		return
+	}
+
+	if rvo.Elem().CanSet() {
+		rvo.Elem().Set(rv)
+	}
+}
+
+func (d *DB) selectStruct(ctx context.Context, query string, args []any, rv reflect.Value) {
+	rows, err := d.QueryContext(ctx, query, args...)
+	if err != nil {
+		d.logger.Errorf("error running query: %v", err)
+		return
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		d.rowsToStruct(rows, rv)
+	}
+
+	if rows.Err() != nil {
+		d.logger.Errorf("error parsing rows : %v", rows.Err())
+		return
+	}
+}
+
+func (*DB) rowsToStruct(rows *sql.Rows, vo reflect.Value) {
+	v := vo
+	if vo.Kind() == reflect.Pointer {
+		v = vo.Elem()
+	}
+
+	// Map fields and their indexes by normalized name
+	fieldNameIndex := map[string]int{}
+
+	for i := 0; i < v.Type().NumField(); i++ {
+		var name string
+
+		f := v.Type().Field(i)
+		tag := f.Tag.Get(dbStructTag)
+
+		if tag != "" {
+			name = tag
+		} else {
+			name = ToSnakeCase(f.Name)
+		}
+
+		fieldNameIndex[name] = i
+	}
+
+	fields := []any{}
+	columns, _ := rows.Columns()
+
+	for _, c := range columns {
+		if i, ok := fieldNameIndex[c]; ok {
+			fields = append(fields, v.Field(i).Addr().Interface())
+		} else {
+			var i any
+
+			fields = append(fields, &i)
+		}
+	}
+
+	_ = rows.Scan(fields...)
+
+	if vo.CanSet() {
+		vo.Set(v)
+	}
+}
+
+var matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+var matchAllCap = regexp.MustCompile("([a-z0-9])([A-Z])")
+
+func ToSnakeCase(str string) string {
+	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
+
+	return strings.ToLower(snake)
+}

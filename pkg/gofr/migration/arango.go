@@ -1,0 +1,148 @@
+package migration
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"gofr.dev/pkg/gofr/container"
+)
+
+// arangoDS is our adapter struct that will implement both interfaces.
+type arangoDS struct {
+	client ArangoDB
+}
+
+// arangoMigrator struct remains the same but uses our adapter.
+type arangoMigrator struct {
+	ArangoDB
+	migrator
+}
+
+const (
+	arangoMigrationDB         = "_system"
+	arangoMigrationCollection = "gofr_migrations"
+
+	getArangoMigrationVersions = `
+  FOR doc IN gofr_migrations
+    RETURN doc.version
+`
+	insertArangoMigrationRecord = `
+  INSERT {
+    version: @version,
+    method: @method,
+    start_time: @start_time,
+    duration: @duration
+  } INTO gofr_migrations
+`
+)
+
+func (ds arangoDS) CreateDB(ctx context.Context, database string) error {
+	return ds.client.CreateDB(ctx, database)
+}
+
+func (ds arangoDS) DropDB(ctx context.Context, database string) error {
+	return ds.client.DropDB(ctx, database)
+}
+
+func (ds arangoDS) CreateCollection(ctx context.Context, database, collection string, isEdge bool) error {
+	return ds.client.CreateCollection(ctx, database, collection, isEdge)
+}
+
+func (ds arangoDS) DropCollection(ctx context.Context, database, collection string) error {
+	return ds.client.DropCollection(ctx, database, collection)
+}
+
+func (ds arangoDS) CreateGraph(ctx context.Context, database, graph string, edgeDefinitions any) error {
+	return ds.client.CreateGraph(ctx, database, graph, edgeDefinitions)
+}
+
+func (ds arangoDS) DropGraph(ctx context.Context, database, graph string) error {
+	return ds.client.DropGraph(ctx, database, graph)
+}
+
+func (ds arangoDS) apply(m migrator) migrator {
+	return arangoMigrator{
+		ArangoDB: ds,
+		migrator: m,
+	}
+}
+
+func (am arangoMigrator) checkAndCreateMigrationTable(c *container.Container) error {
+	err := am.CreateCollection(context.Background(), arangoMigrationDB, arangoMigrationCollection, false)
+	if err != nil {
+		c.Debug("Migration collection might already exist:", err)
+	}
+
+	return am.migrator.checkAndCreateMigrationTable(c)
+}
+
+func (am arangoMigrator) getAppliedMigrations(c *container.Container) (map[int64]struct{}, error) {
+	var versions []int64
+
+	err := c.ArangoDB.Query(context.Background(), arangoMigrationDB, getArangoMigrationVersions, nil, &versions)
+	if err != nil {
+		return nil, fmt.Errorf("arangodb: %w", err)
+	}
+
+	c.Debugf("ArangoDB applied migrations fetched: %v", versions)
+
+	applied, err := am.migrator.getAppliedMigrations(c)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, v := range versions {
+		applied[v] = struct{}{}
+	}
+
+	return applied, nil
+}
+
+func (am arangoMigrator) beginTransaction(c *container.Container) transactionData {
+	data := am.migrator.beginTransaction(c)
+
+	c.Debug("ArangoDB migrator begin successfully")
+
+	return data
+}
+
+func (am arangoMigrator) commitMigration(c *container.Container, data *transactionData) error {
+	if data.UsedDatasources[dsArangoDB] {
+		bindVars := map[string]any{
+			migrationFieldVersion:   data.MigrationNumber,
+			migrationFieldMethod:    migrationMethodUP,
+			migrationFieldStartTime: data.StartTime,
+			migrationFieldDuration:  time.Since(data.StartTime).Milliseconds(),
+		}
+
+		var result []map[string]any
+
+		err := c.ArangoDB.Query(context.Background(), arangoMigrationDB, insertArangoMigrationRecord, bindVars, &result)
+		if err != nil {
+			return err
+		}
+
+		c.Debugf("Inserted record for migration %v in ArangoDB gofr_migrations collection", data.MigrationNumber)
+	}
+
+	return am.migrator.commitMigration(c, data)
+}
+
+func (am arangoMigrator) rollback(c *container.Container, data *transactionData) {
+	am.migrator.rollback(c, data)
+
+	c.Fatalf("Migration %v failed and rolled back", data.MigrationNumber)
+}
+
+func (am arangoMigrator) lock(ctx context.Context, cancel context.CancelFunc, c *container.Container, ownerID string) error {
+	return am.migrator.lock(ctx, cancel, c, ownerID)
+}
+
+func (am arangoMigrator) unlock(c *container.Container, ownerID string) error {
+	return am.migrator.unlock(c, ownerID)
+}
+
+func (arangoMigrator) name() string {
+	return "ArangoDB"
+}

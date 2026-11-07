@@ -1,0 +1,564 @@
+package gofr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/gorilla/mux"
+	"golang.org/x/sync/errgroup"
+
+	"gofr.dev/pkg/gofr/config"
+	"gofr.dev/pkg/gofr/container"
+	gofrHTTP "gofr.dev/pkg/gofr/http"
+	"gofr.dev/pkg/gofr/internal/rbaccheck"
+	"gofr.dev/pkg/gofr/internal/routemark"
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/metrics"
+	"gofr.dev/pkg/gofr/migration"
+	"gofr.dev/pkg/gofr/rbac"
+	"gofr.dev/pkg/gofr/service"
+	"gofr.dev/pkg/gofr/traces/exporters"
+)
+
+const (
+	configLocation = "./configs"
+)
+
+var (
+	errStartupHookPanic = errors.New("startup hook panicked")
+
+	// errMCPPortNotANumber and errMCPPortOutOfRange are the two MCP_PORT values that can never be
+	// served. Neither message repeats the configured value: it comes from Config.Get, which CodeQL
+	// treats as a potentially sensitive source, and the operator knows what they set. The range
+	// error carries the parsed number, which is safe -- it parsed as an integer.
+	errMCPPortNotANumber = errors.New("MCP_PORT is not a number")
+	errMCPPortOutOfRange = errors.New("MCP_PORT is outside the valid port range")
+)
+
+// App is the main application in the GoFr framework.
+type App struct {
+	// Config can be used by applications to fetch custom configurations from environment or file.
+	Config config.Config // If we directly embed, unnecessary confusion between app.Get and app.GET will happen.
+
+	grpcServer   *grpcServer
+	httpServer   *httpServer
+	metricServer *metricServer
+	mcpServer    *mcpServer
+
+	cmd  *cmd
+	cron *Crontab
+
+	// container is unexported because this is an internal implementation and applications are provided access to it via Context
+	container *container.Container
+
+	// shutdownTracer flushes the pending span batch and shuts the TracerProvider
+	// down. Set by initTracer; nil when tracing was never initialized.
+	shutdownTracer exporters.ShutdownFunc
+
+	grpcRegistered      bool
+	httpRegistered      bool
+	rbacEnabled         bool // set by the first EnableRBAC that installs a config; guards its metric registration
+	subscriptionManager SubscriptionManager
+	graphqlManager      graphQLRunner
+	onStartHooks        []func(ctx *Context) error
+	mu                  sync.Mutex
+
+	// readinessChecks are the application-registered readiness checks for /.well-known/health,
+	// evaluated in registration order; empty means the endpoint keeps its default behavior.
+	// Guarded by mu: registration is documented as pre-Run, but probes run concurrently.
+	readinessChecks []readinessCheck
+
+	// mcpConfigErr records an MCP_PORT that cannot be served -- a value that is not a number, or
+	// one outside the valid TCP range. It is recorded rather than acted on because EnableMCP runs
+	// in the application's own setup, where there is nothing to abort yet; Run reports it at the
+	// same point it reports a port it could not claim. See bindMCPServer.
+	mcpConfigErr error
+
+	// rbacConfigs holds every RBAC config installed by EnableRBAC, in order, kept so Run can check
+	// them against the complete route table. Each call installs a middleware that enforces its own
+	// config, so all of them are checked. See prepareHTTPServer.
+	rbacConfigs []*rbac.Config
+
+	// rbacRoutes is the route table as the RBAC route check reads it. httpServerSetup fills it from
+	// the walk it already makes, and only when rbacConfigs is set.
+	rbacRoutes []rbaccheck.Route
+
+	// exit is os.Exit, indirected so a test can observe the status a failed startup or a failed
+	// command reports without taking the test binary down with it. Nil means os.Exit, which is what
+	// every real app uses.
+	exit func(int)
+}
+
+// exitCodeFailure is the status the process reports when a run failed: startup was abandoned (a
+// failed OnStart hook, an unclaimable MCP port, or an MCP_PORT that could never be served), or a
+// CMD app's subcommand failed (its handler returned an error, or the subcommand was missing or
+// unknown).
+//
+// It matters because whatever started the process reads it and nothing else. Under restartPolicy:
+// OnFailure, or in a Job, a service that refused to start and exited 0 is recorded as having
+// succeeded and is never retried; a shell or CI job records a failed command that exited 0 as a
+// success.
+const exitCodeFailure = 1
+
+// exitProcess reports code to the process: through a.exit when a test has set it, otherwise with
+// os.Exit. It is the only place in this package that ends the process.
+//
+// This is not the Logger.Fatalf that startup used to call. Fatalf was os.Exit from library code,
+// mid-setup, with the container's datasources still open and nothing unwound. exitProcess is only
+// called at the top of the call stack, once there is nothing left to clean up: at the bottom of Run
+// after shutdownAfterFailedStartup has released everything and no server was started, and at the
+// end of runCMD after telemetry has been flushed and the logger closed.
+func (a *App) exitProcess(code int) {
+	if a.exit != nil {
+		a.exit(code)
+
+		return
+	}
+
+	// deep-exit is the right rule and this is the exception it exists to make you argue for: both
+	// callers are the last thing an application's main does (app.Run), everything the run opened
+	// has already been released, and the exit status is the only channel an orchestrator, shell or
+	// CI job reads to learn that the run failed. The logger's Fatal carries the same exemption for
+	// the same kind of reason.
+	//nolint:revive // deep-exit: see above -- top of the call stack, after cleanup, nothing skipped.
+	os.Exit(code)
+}
+
+func (a *App) runOnStartHooks(ctx context.Context) error {
+	// Use the existing newContext function with noopRequest
+	gofrCtx := newContext(nil, noopRequest{}, a.container)
+
+	// Set the context for cancellation support
+	gofrCtx.Context = ctx
+
+	for i, hook := range a.onStartHooks {
+		// Add panic recovery to prevent entire application crash
+		var hookErr error
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					a.Logger().Errorf("OnStart hook %d panicked: %v", i, r)
+					hookErr = fmt.Errorf("hook %d: %w: %v", i, errStartupHookPanic, r)
+				}
+			}()
+
+			hookErr = hook(gofrCtx)
+		}()
+
+		if hookErr != nil {
+			a.Logger().Errorf("OnStart hook failed: %v", hookErr)
+			return hookErr
+		}
+
+		// Check if context was canceled
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+
+	return nil
+}
+
+// Shutdown stops the service(s) and close the application.
+// It shuts down the HTTP, gRPC, Metrics servers and closes the container's active connections to datasources.
+func (a *App) Shutdown(ctx context.Context) error {
+	var err error
+	if a.httpServer != nil {
+		err = errors.Join(err, a.httpServer.Shutdown(ctx))
+	}
+
+	if a.grpcServer != nil {
+		err = errors.Join(err, a.grpcServer.Shutdown(ctx))
+	}
+
+	if a.cron != nil {
+		// Joins the in-flight cron jobs, but only until the shutdown deadline —
+		// a job that outlives it must not hold the whole shutdown open.
+		a.cron.stop(ctx.Done())
+	}
+
+	if a.metricServer != nil {
+		err = errors.Join(err, a.metricServer.Shutdown(ctx))
+	}
+
+	if a.mcpServer != nil {
+		err = errors.Join(err, a.mcpServer.Shutdown(ctx))
+	}
+
+	// Flush telemetry before the container's connections go: the final span batch
+	// and metric window are the ones describing the shutdown itself.
+	err = errors.Join(err, a.shutdownTraces(ctx))
+
+	if a.container != nil {
+		err = errors.Join(err, a.container.ShutdownMetrics(ctx))
+		err = errors.Join(err, a.container.Close())
+	}
+
+	a.container.Logger.Info("Application shutdown complete")
+
+	// Close logger file if applicable
+	if closer, ok := a.container.Logger.(io.Closer); ok {
+		err = errors.Join(err, closer.Close())
+	}
+
+	return err
+}
+
+func isPortAvailable(port int) bool {
+	dialer := net.Dialer{Timeout: checkPortTimeout}
+
+	conn, err := dialer.DialContext(context.Background(), "tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return true
+	}
+
+	conn.Close()
+
+	return false
+}
+
+func (a *App) httpServerSetup() {
+	// TODO: find a way to read REQUEST_TIMEOUT config only once and log it there. currently doing it twice one for populating
+	// the value and other for logging
+	requestTimeout := a.Config.Get("REQUEST_TIMEOUT")
+	if requestTimeout != "" {
+		timeoutVal, err := strconv.Atoi(requestTimeout)
+		if err != nil || timeoutVal < 0 {
+			a.container.Error("invalid value of config REQUEST_TIMEOUT.")
+		}
+	}
+
+	routes := newRBACRouteCollector(len(a.rbacConfigs) > 0)
+
+	// Register default routes - these are only added when HTTP server is actually starting
+	routes.startBuiltIns(&a.httpServer.router.Router)
+
+	a.add(http.MethodGet, service.HealthPath, a.healthHandler)
+	a.add(http.MethodGet, service.AlivePath, liveHandler)
+	a.add(http.MethodGet, "/favicon.ico", faviconHandler)
+
+	// Add OpenAPI/Swagger routes if openapi.json exists
+	a.checkAndAddOpenAPIDocumentation()
+
+	// Register GraphQL Playground UI under /.well-known/ if GraphQL is enabled
+	if a.graphQLActive() {
+		a.add(http.MethodGet, "/.well-known/graphql/ui", playgroundHandler)
+	}
+
+	routes.endBuiltIns(&a.httpServer.router.Router)
+
+	for dirName, endpoint := range a.httpServer.staticFiles {
+		a.httpServer.router.AddStaticFiles(a.Logger(), endpoint, dirName)
+	}
+
+	a.setupGraphQL()
+
+	a.logReadiness()
+
+	// The one catch-all GoFr registers: marked so the RBAC trace label and route check can tell it
+	// from a route or static directory at "/", which share its template.
+	routemark.MarkCatchAll(a.httpServer.router.PathPrefix("/")).Handler(a.catchAll())
+
+	var registeredMethods []string
+
+	_ = a.httpServer.router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
+		met, _ := route.GetMethods()
+		for _, method := range met {
+			if !contains(registeredMethods, method) { // Check for uniqueness before adding
+				registeredMethods = append(registeredMethods, method)
+			}
+		}
+
+		routes.add(route, met)
+
+		return nil
+	})
+
+	a.rbacRoutes = routes.routes
+
+	*a.httpServer.router.RegisteredRoutes = registeredMethods
+}
+
+func (a *App) startSubscriptions(ctx context.Context) error {
+	if len(a.subscriptionManager.subscriptions) == 0 {
+		return nil
+	}
+
+	group := errgroup.Group{}
+	// Start subscribers concurrently using go-routines
+	for topic, handler := range a.subscriptionManager.subscriptions {
+		subscriberTopic, subscriberHandler := topic, handler
+
+		group.Go(func() error {
+			return a.subscriptionManager.startSubscriber(ctx, subscriberTopic, subscriberHandler)
+		})
+	}
+
+	return group.Wait()
+}
+
+// readConfig reads the configuration from the default location.
+func (a *App) readConfig(isAppCMD bool) {
+	var location string
+
+	if _, err := os.Stat(configLocation); err == nil {
+		location = configLocation
+	}
+
+	if isAppCMD {
+		a.Config = config.NewEnvFile(location, logging.NewFileLogger(""))
+
+		return
+	}
+
+	a.Config = config.NewEnvFile(location, logging.NewLogger(logging.INFO))
+}
+
+// AddHTTPService registers HTTP service in container.
+func (a *App) AddHTTPService(serviceName, serviceAddress string, options ...service.Options) {
+	if a.container.Services == nil {
+		a.container.Services = make(map[string]service.HTTP)
+	}
+
+	if _, ok := a.container.Services[serviceName]; ok {
+		a.container.Debugf("Service already registered Name: %v", serviceName)
+	}
+
+	options = append([]service.Options{service.WithAttributes(map[string]string{serviceNameAttributeKey: serviceName})}, options...)
+
+	a.container.Services[serviceName] = service.NewHTTPService(serviceAddress, a.container.Logger, a.container.Metrics(), options...)
+}
+
+// GraphQLQuery registers a named query resolver for the GraphQL schema.
+//
+// Developer Notes:
+//   - GraphQL uses dedicated methods (GraphQLQuery, GraphQLMutation) instead of standard HTTP verb
+//     methods (GET, POST) because GraphQL operations are distinguished by type in the request body,
+//     not by HTTP method. All operations are served through a single POST /graphql endpoint.
+//   - POST-only is intentional: it is the required method per the GraphQL-over-HTTP spec. GET is
+//     optional and only useful for CDN caching, which adds complexity without clear benefit here.
+//   - Only query and mutation are supported for now. Subscriptions require a persistent connection
+//     (WebSocket) and are out of scope for this initial implementation.
+//   - The resolver name must match a field in the Query type defined in ./configs/schema.graphqls.
+//     Multiple resolvers can be registered, but all resolve fields within that single schema file.
+func (a *App) GraphQLQuery(name string, handler Handler) {
+	if !a.httpRegistered && !isPortAvailable(a.httpServer.port) {
+		a.container.Logger.Fatalf("http port %d is blocked or unreachable", a.httpServer.port)
+	}
+
+	a.mu.Lock()
+
+	if a.graphqlManager == nil {
+		a.graphqlManager = newGraphQLRunner(a.container)
+	}
+
+	a.mu.Unlock()
+
+	a.httpRegistered = true
+	a.graphqlManager.RegisterQuery(name, handler)
+}
+
+// GraphQLMutation registers a named mutation resolver for the GraphQL schema.
+// See GraphQLQuery for design rationale. Mutations follow the same pattern but are intended
+// for operations with side effects (create, update, delete).
+func (a *App) GraphQLMutation(name string, handler Handler) {
+	if !a.httpRegistered && !isPortAvailable(a.httpServer.port) {
+		a.container.Logger.Fatalf("http port %d is blocked or unreachable", a.httpServer.port)
+	}
+
+	a.mu.Lock()
+
+	if a.graphqlManager == nil {
+		a.graphqlManager = newGraphQLRunner(a.container)
+	}
+
+	a.mu.Unlock()
+
+	a.httpRegistered = true
+	a.graphqlManager.RegisterMutation(name, handler)
+}
+
+// Metrics returns the metrics manager associated with the App.
+func (a *App) Metrics() metrics.Manager {
+	return a.container.Metrics()
+}
+
+// Logger returns the logger instance associated with the App.
+func (a *App) Logger() logging.Logger {
+	return a.container.Logger
+}
+
+// SubCommand adds a sub-command to the CLI application.
+// Can be used to create commands like "kubectl get" or "kubectl get ingress".
+func (a *App) SubCommand(pattern string, handler Handler, options ...Options) {
+	a.cmd.addRoute(pattern, handler, options...)
+}
+
+// Migrate applies a set of migrations to the application's database.
+//
+// The migrationsMap argument is a map where the key is the version number of the migration
+// and the value is a migration.Migrate instance that implements the migration logic.
+func (a *App) Migrate(migrationsMap map[int64]migration.Migrate) {
+	// TODO : Move panic recovery at central location which will manage for all the different cases.
+	defer func() {
+		panicRecovery(recover(), a.container.Logger)
+	}()
+
+	migration.Run(migrationsMap, a.container)
+}
+
+// Subscribe registers a handler for the given topic.
+//
+// If the subscriber is not initialized in the container, an error is logged and
+// the subscription is not registered.
+func (a *App) Subscribe(topic string, handler SubscribeFunc) {
+	if topic == "" || handler == nil {
+		a.container.Logger.Errorf("invalid subscription: topic and handler must not be empty or nil")
+
+		return
+	}
+
+	if a.container.GetSubscriber() == nil {
+		a.container.Logger.Errorf("subscriber not initialized in the container")
+
+		return
+	}
+
+	a.subscriptionManager.subscriptions[topic] = handler
+}
+
+// UseMiddleware is a setter method for adding user defined custom middleware to GoFr's router.
+func (a *App) UseMiddleware(middlewares ...gofrHTTP.Middleware) {
+	a.httpServer.router.UseMiddleware(middlewares...)
+}
+
+// UseMiddlewareWithContainer adds a middleware that has access to the container
+// and wraps the provided handler with the middleware logic.
+//
+// The `middleware` function receives the container and the handler, allowing
+// the middleware to modify the request processing flow.
+//
+// Deprecated: UseMiddlewareWithContainer will be removed in a future release.
+// Please use the [*App.UseMiddleware] method that does not depend on the container.
+func (a *App) UseMiddlewareWithContainer(middlewareHandler func(c *container.Container, handler http.Handler) http.Handler) {
+	a.httpServer.router.Use(func(h http.Handler) http.Handler {
+		// Wrap the provided handler `h` with the middleware function `middlewareHandler`
+		return middlewareHandler(a.container, h)
+	})
+}
+
+// AddCronJob registers a cron job to the cron table.
+// The cron expression can be either a 5-part or 6-part format. The 6-part format includes an
+// optional second field (in beginning) and others being minute, hour, day, month and day of week respectively.
+func (a *App) AddCronJob(schedule, jobName string, job CronFunc) {
+	if a.cron == nil {
+		a.cron = NewCron(a.container)
+	}
+
+	if err := a.cron.AddJob(schedule, jobName, job); err != nil {
+		a.Logger().Errorf("error adding cron job, err: %v", err)
+	}
+}
+
+// contains is a helper function checking for duplicate entry in a slice.
+func contains(elems []string, v string) bool {
+	for _, s := range elems {
+		if v == s {
+			return true
+		}
+	}
+
+	return false
+}
+
+// AddStaticFiles registers a static file endpoint for the application.
+//
+// The provided `endpoint` will be used as the prefix for the static file
+// server. The `filePath` specifies the directory containing the static files.
+// If `filePath` starts with "./", it will be interpreted as a relative path
+// to the current working directory.
+func (a *App) AddStaticFiles(endpoint, filePath string) {
+	if !a.httpRegistered && !isPortAvailable(a.httpServer.port) {
+		a.container.Logger.Fatalf("http port %d is blocked or unreachable", a.httpServer.port)
+	}
+
+	a.httpRegistered = true
+
+	// Normalize the endpoint up front so every error log below reports the same
+	// '/endpoint' form (previously the getwd and os.Stat logs disagreed).
+	endpoint = "/" + strings.Trim(endpoint, "/")
+
+	if !strings.HasPrefix(filePath, "./") && !filepath.IsAbs(filePath) {
+		filePath = "./" + filePath
+	}
+
+	// update file path based on current directory if it starts with ./
+	if strings.HasPrefix(filePath, "./") {
+		currentWorkingDir, err := os.Getwd()
+		if err != nil {
+			a.container.Logger.Errorf("error in registering '%s' static endpoint, "+
+				"failed to get current working directory: %v", endpoint, err)
+
+			return
+		}
+
+		filePath = filepath.Join(currentWorkingDir, filePath)
+	}
+
+	if _, err := os.Stat(filePath); err != nil {
+		a.container.Logger.Errorf("error in registering '%s' static endpoint, error: %v", endpoint, err)
+		return
+	}
+
+	a.httpServer.staticFiles[filePath] = endpoint
+}
+
+// OnStart registers a startup hook that will be executed when the application starts.
+// The hook function receives a Context that provides access to the application's
+// container, logger, and configuration. This is useful for performing initialization
+// tasks such as database connections, service registrations, or other setup operations
+// that need to be completed before the application begins serving requests.
+//
+// Example usage:
+//
+//	app := gofr.New()
+//	app.OnStart(func(ctx *gofr.Context) error {
+//	    // Initialize database connection
+//	    db, err := database.Connect(ctx.Config.Get("DB_URL"))
+//	    if err != nil {
+//	        return err
+//	    }
+//	    ctx.Container.SQL = db
+//	    return nil
+//	})
+func (a *App) OnStart(hook func(ctx *Context) error) {
+	a.onStartHooks = append(a.onStartHooks, hook)
+}
+
+// graphQLActive reports whether this app has GraphQL resolvers registered AND was
+// built with the engine linked in.
+func (a *App) graphQLActive() bool {
+	return graphQLLinked && a.graphqlManager != nil
+}
+
+func (a *App) setupGraphQL() {
+	if a.graphQLActive() {
+		err := a.graphqlManager.buildSchema()
+		if err != nil {
+			a.container.Logger.Fatalf("GraphQL build error: %v", err)
+		}
+
+		// Functional endpoint: served via POST per spec to ensure data safety and consistency.
+		a.httpServer.router.Add(http.MethodPost, "/graphql", a.graphqlManager.GetHandler())
+	}
+}

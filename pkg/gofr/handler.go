@@ -1,0 +1,350 @@
+package gofr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel/trace"
+
+	"gofr.dev/pkg/gofr/container"
+	gofrHTTP "gofr.dev/pkg/gofr/http"
+	"gofr.dev/pkg/gofr/http/response"
+	"gofr.dev/pkg/gofr/logging"
+	"gofr.dev/pkg/gofr/static"
+)
+
+const colorCodeError = 202 // 202 is red color code
+
+// faviconContentType is the media type of the favicon served at /favicon.ico.
+const faviconContentType = "image/x-icon"
+
+type Handler func(c *Context) (any, error)
+
+/*
+Developer Note: There is an implementation where we do not need this internal handler struct
+and directly use Handler. However, in that case the container dependency is not injected and
+has to be created inside ServeHTTP method, which will result in multiple unnecessary calls.
+This is what we implemented first.
+
+There is another possibility where we write our own Router implementation and let httpServer
+use that router which will return a Handler and httpServer will then create the context with
+injecting container and call that Handler with the new context. A similar implementation is
+done in CMD. Since this will require us to write our own router - we are not taking that path
+for now. In the future, this can be considered as well if we are writing our own HTTP router.
+*/
+
+type handler struct {
+	function       Handler
+	container      *container.Container
+	requestTimeout time.Duration
+}
+
+// handlerOutcome carries the (result, error) pair from the per-request
+// handler goroutine back to ServeHTTP. Sending it through a buffered
+// channel keeps the goroutine's writes invisible to the main goroutine
+// until the channel receive completes — no shared writable state across
+// the two goroutines.
+type handlerOutcome struct {
+	result any
+	err    error
+}
+
+type ErrorLogEntry struct {
+	TraceID string `json:"trace_id,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (el *ErrorLogEntry) PrettyPrint(writer io.Writer) {
+	fmt.Fprintf(writer, "\u001B[38;5;8m%s \u001B[38;5;%dm%s \n", el.TraceID, colorCodeError, el.Error)
+}
+
+func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c := newHTTPContext(w, r, h.container)
+
+	// Carry the SpanContext (a value type, no allocation) rather than eagerly
+	// formatting the trace ID. TraceID().String() allocates a 32-character
+	// string on every request, but the only consumer is logError, which runs
+	// only when a handler returns an error.
+	spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+
+	isWebSocket := websocket.IsWebSocketUpgrade(r)
+
+	if isWebSocket {
+		// If the request is a WebSocket upgrade, do not apply the timeout
+		c.Context = r.Context()
+	} else if h.requestTimeout != 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), h.requestTimeout)
+		defer cancel()
+
+		c.Context = ctx
+	}
+
+	var (
+		result any
+		err    error
+	)
+
+	if !isWebSocket && h.requestTimeout == 0 {
+		result, err = h.serveInline(c, spanCtx)
+	} else {
+		result, err = h.serveWithGoroutine(c, spanCtx, r)
+	}
+
+	// Handle custom headers if 'result' is a 'Response'. A pointer is handled
+	// equivalently to the value form, otherwise its Headers are silently dropped.
+	switch resp := result.(type) {
+	case response.Response:
+		resp.SetCustomHeaders(w)
+	case *response.Response:
+		if resp != nil {
+			resp.SetCustomHeaders(w)
+		}
+	}
+
+	c.responder.Respond(result, err)
+}
+
+// serveInline runs the user handler in the calling goroutine. Used when
+// there is no server-side request timeout and the request is not a
+// WebSocket upgrade — the dominant case in pprof. Avoids the per-request
+// goroutine + 2 channels + select that serveWithGoroutine needs (~3-4 KB
+// allocations and a goroutine context switch per request).
+//
+// Cancellation still works: c.Context.Err() is checked after the handler
+// returns. The goroutine path's "abort on cancel" was always cosmetic —
+// Go can't kill a goroutine, so the handler ran to completion in both
+// designs. The client never sees the disconnect-detected response either
+// way (TCP connection is gone). Response wire shape is byte-identical to
+// serveWithGoroutine because the (result, err) pair feeds the same
+// Respond call.
+func (h handler) serveInline(c *Context, spanCtx trace.SpanContext) (result any, err error) {
+	panicked := false
+
+	func() {
+		defer func() {
+			if re := recover(); re != nil {
+				logPanic(h.container.Logger, re)
+
+				err = gofrHTTP.ErrorPanicRecovery{}
+				panicked = true
+			}
+		}()
+
+		result, err = h.function(c)
+	}()
+
+	if !panicked {
+		h.logError(spanCtx, err)
+	}
+
+	// Map a canceled / deadline-exceeded ctx to the right error so the
+	// wire shape matches serveWithGoroutine:
+	//   - context.Canceled         → ErrorClientClosedRequest (HTTP 499)
+	//   - context.DeadlineExceeded → ErrorRequestTimeout      (HTTP 408)
+	// In both cases we drop the handler's result (which may have been
+	// computed despite the cancellation) so Respond emits the bare error
+	// envelope instead of a 206 Partial Content.
+	if ctxErr := c.Context.Err(); !panicked && ctxErr != nil {
+		result = nil
+		err = gofrHTTP.ErrorRequestTimeout{}
+
+		if errors.Is(ctxErr, context.Canceled) {
+			err = gofrHTTP.ErrorClientClosedRequest{}
+		}
+	}
+
+	return result, err
+}
+
+// serveWithGoroutine runs the user handler in a fresh goroutine and waits
+// on a select. Used when h.requestTimeout > 0 (the deadline branch must
+// be able to fire while the handler is still running) or when the request
+// is a WebSocket upgrade (handleWebSocketUpgrade has to see the request
+// after the handler hijacks the connection).
+//
+// The handler outcome is sent through a buffered channel rather than to
+// shared variables, so its (result, err) pair never becomes a location
+// both goroutines touch. Buffer size 1 lets the handler goroutine finish
+// writing and exit even after the main goroutine has already taken the
+// ctx.Done or panicked branch.
+//
+// c.Context is a location both goroutines DO touch: h.function runs in the
+// spawned goroutine and is free to reassign it (App.WebSocket does, to
+// thread the connection through it), while this goroutine's select used to
+// read c.Context.Done() directly — a data race, since nothing ordered the
+// two accesses. See the watchCtx snapshot below, taken before the goroutine
+// is spawned, for the fix.
+func (h handler) serveWithGoroutine(c *Context, spanCtx trace.SpanContext, r *http.Request) (result any, err error) {
+	done := make(chan handlerOutcome, 1)
+	panicked := make(chan struct{})
+
+	// Snapshot the context to watch for cancellation before spawning the
+	// handler goroutine below. h.function may reassign c.Context while it
+	// runs (App.WebSocket does, to thread the connection through it) —
+	// reading c.Context in the select instead of here would race that
+	// write. watchCtx is a local copy this goroutine alone reads, so the
+	// write in the spawned goroutine and this read never overlap.
+	watchCtx := c.Context
+
+	go func() {
+		defer func() {
+			panicRecoveryHandler(recover(), h.container.Logger, panicked)
+		}()
+
+		res, e := h.function(c)
+		h.logError(spanCtx, e)
+
+		done <- handlerOutcome{res, e}
+	}()
+
+	select {
+	case <-watchCtx.Done():
+		// Server-side timeout or client cancellation. Map to the matching
+		// gofrHTTP error so Respond emits 408 (timeout) or 499 (client
+		// closed).
+		err = gofrHTTP.ErrorRequestTimeout{}
+
+		if errors.Is(watchCtx.Err(), context.Canceled) {
+			err = gofrHTTP.ErrorClientClosedRequest{}
+		}
+	case out := <-done:
+		result = out.result
+		err = out.err
+
+		handleWebSocketUpgrade(r)
+	case <-panicked:
+		err = gofrHTTP.ErrorPanicRecovery{}
+	}
+
+	return result, err
+}
+
+func liveHandler(*Context) (any, error) {
+	return struct {
+		Status string `json:"status"`
+	}{Status: "UP"}, nil
+}
+
+func faviconHandler(*Context) (any, error) {
+	data, err := os.ReadFile("./static/favicon.ico")
+	if err != nil {
+		data, err = static.Files.ReadFile("favicon.ico")
+	}
+
+	return response.File{
+		Content:     data,
+		ContentType: faviconContentType,
+	}, err
+}
+
+func catchAllHandler(*Context) (any, error) {
+	return nil, gofrHTTP.ErrorInvalidRoute{}
+}
+
+func methodNotAllowedHandler(*Context) (any, error) {
+	return nil, gofrHTTP.ErrorMethodNotAllowed{}
+}
+
+// catchAll answers every request no registered route matched: 405 when the path is registered for
+// other methods, 404 when it is not registered at all.
+//
+// It is installed as a real PathPrefix("/") route rather than as mux's NotFoundHandler and
+// MethodNotAllowedHandler because mux applies the middleware chain only to a matched route
+// (gorilla/mux mux.go, guarded by MatchErr == nil). Served from those two fields, a 404 or 405
+// skips Tracer, Logging, Metrics and CORS — the CORS preflight to a GET-only path is answered 405
+// with no CORS headers, and every unknown path disappears from logs and metrics. As a route it
+// always matches, mux clears the method mismatch left by the routes before it (route.go, the else
+// arm of the matcher loop), and the whole chain runs.
+func (a *App) catchAll() http.Handler {
+	router := a.httpServer.router
+	notFound := handler{function: catchAllHandler, container: a.container}
+	methodNotAllowed := handler{function: methodNotAllowedHandler, container: a.container}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods := router.AllowedMethods(r)
+		if len(methods) == 0 {
+			notFound.ServeHTTP(w, r)
+
+			return
+		}
+
+		// OPTIONS is listed because the CORS middleware answers it for every path before any route
+		// handler runs, so the resource does support it; RFC 9110 §10.2.1 has Allow list exactly that.
+		// A route registered for OPTIONS on the router itself has already put it in the list.
+		if !slices.Contains(methods, http.MethodOptions) {
+			methods = append(methods, http.MethodOptions)
+		}
+
+		// Sort after adding OPTIONS so the header is fully ordered, not "registered methods first,
+		// OPTIONS last". RFC 9110 treats Allow as an unordered set, so order is for readability only.
+		slices.Sort(methods)
+
+		w.Header().Set("Allow", strings.Join(methods, ", "))
+		methodNotAllowed.ServeHTTP(w, r)
+	})
+}
+
+func panicRecoveryHandler(re any, log logging.Logger, panicked chan struct{}) {
+	if re == nil {
+		return
+	}
+
+	close(panicked)
+	logPanic(log, re)
+}
+
+// logPanic emits the panicLog structure used by both serveInline and
+// serveWithGoroutine. Single definition prevents the two paths drifting
+// in what they record (error message, stack trace) for an otherwise
+// identical recover.
+func logPanic(log logging.Logger, re any) {
+	log.Error(panicLog{
+		Error:      fmt.Sprint(re),
+		StackTrace: string(debug.Stack()),
+	})
+}
+
+// logError logs the error (if any) with the trace ID and the error message.
+// The trace ID is formatted here, on the error path only, rather than on every
+// request.
+func (h handler) logError(spanCtx trace.SpanContext, err error) {
+	if err != nil {
+		errorLog := &ErrorLogEntry{TraceID: spanCtx.TraceID().String(), Error: err.Error()}
+
+		// define the default log level for error
+		loggerHelper := h.container.Logger.Error
+
+		switch logging.GetLogLevelForError(err) {
+		case logging.ERROR:
+			// we use the default log level for error
+		case logging.INFO:
+			loggerHelper = h.container.Logger.Info
+		case logging.NOTICE:
+			loggerHelper = h.container.Logger.Notice
+		case logging.DEBUG:
+			loggerHelper = h.container.Logger.Debug
+		case logging.WARN:
+			loggerHelper = h.container.Logger.Warn
+		case logging.FATAL:
+			loggerHelper = h.container.Logger.Fatal
+		}
+
+		loggerHelper(errorLog)
+	}
+}
+
+func handleWebSocketUpgrade(r *http.Request) {
+	if websocket.IsWebSocketUpgrade(r) {
+		// Do not respond with HTTP headers since this is a WebSocket request
+		return
+	}
+}
